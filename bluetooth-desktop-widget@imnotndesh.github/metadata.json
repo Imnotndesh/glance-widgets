@@ -1,8 +1,8 @@
 {
-    "uuid": "bluetooth-desktop-widget@yourname.github",
+    "uuid": "bluetooth-desktop-widget@imnotndesh.github",
     "name": "Bluetooth Desktop Widget",
     "description": "Shows connected Bluetooth devices and their battery level as a floating desktop widget, iOS-style.",
-    "shell-version": ["45", "46", "47", "48"],
+    "shell-version": ["45", "46", "47", "48", "49", "50"],
     "url": "https://github.com/Imnotndesh/bluetooth-desktop-widget",
     "version-name": "1.0.0"
 }
