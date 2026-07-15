@@ -1,38 +1,11 @@
-/* prefs.js
- *
- * Generic preferences UI for Desktop Widgets.
- *
- * Two concerns, kept separate:
- *   1. WIDGET_CATALOG — which widgets exist, for the enable/reorder list.
- *      Metadata-only (id/name/icon); duplicated here rather than imported
- *      from extension.js because prefs.js runs in a separate process
- *      (org.gnome.Extensions) that doesn't have access to Shell UI
- *      modules extension.js imports at the top level.
- *   2. Per-widget settings groups — one function per widget that needs
- *      configuration, added to the page below the enable/reorder list.
- *
- * ---------------------------------------------------------------------
- * ADDING A NEW WIDGET'S PREFS
- * ---------------------------------------------------------------------
- * 1. Add an entry to WIDGET_CATALOG (id must match extension.js's
- *    WIDGET_DEFS key exactly).
- * 2. If it needs configuration, write a buildXxxSettingsGroup(settings)
- *    function returning an Adw.PreferencesGroup, and reference it from
- *    that catalog entry's `buildSettings` field.
- * 3. Add the corresponding gschema keys.
- * ---------------------------------------------------------------------
- */
-
 import Adw from 'gi://Adw';
 import Gtk from 'gi://Gtk';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+const SETTINGS_SCHEMA = 'org.gnome.shell.extensions.bluetooth-desktop-widget';
 const SETTINGS_KEY_WIDGETS_CONFIG = 'widgets-config';
 
-// ======================================================================
-// Widget catalog — metadata + optional settings-group builder
-// ======================================================================
 
 const WIDGET_CATALOG = [
     {
@@ -76,14 +49,6 @@ function catalogEntry(id) {
     return WIDGET_CATALOG.find((w) => w.id === id);
 }
 
-// ======================================================================
-// widgets-config load/save helpers
-// ======================================================================
-
-// Returns the ordered config array, guaranteed to contain one entry per
-// catalog widget (missing ones appended as disabled) so the UI always
-// shows every known widget even after a fresh install or a new widget
-// being added to the catalog.
 function loadConfig(settings) {
     let raw = settings.get_string(SETTINGS_KEY_WIDGETS_CONFIG);
     let config = [];
@@ -106,10 +71,6 @@ function loadConfig(settings) {
 function saveConfig(settings, config) {
     settings.set_string(SETTINGS_KEY_WIDGETS_CONFIG, JSON.stringify(config));
 }
-
-// ======================================================================
-// Enable / reorder list
-// ======================================================================
 
 function buildWidgetsListGroup(settings, window) {
     let group = new Adw.PreferencesGroup({
@@ -195,9 +156,6 @@ function buildWidgetsListGroup(settings, window) {
     return group;
 }
 
-// ======================================================================
-// Per-widget settings groups
-// ======================================================================
 
 function buildBluetoothSettingsGroup(settings) {
     let group = new Adw.PreferencesGroup({
@@ -222,20 +180,9 @@ function buildBluetoothSettingsGroup(settings) {
     return group;
 }
 
-// Placeholders for future widgets — wire these up in WIDGET_CATALOG's
-// `buildSettings` field once each widget is implemented in extension.js.
-//
-// function buildWeatherSettingsGroup(settings) { ... }
-// function buildPhotosSettingsGroup(settings) { ... }
-// function buildStorageSettingsGroup(settings) { ... }
-
-// ======================================================================
-// Window assembly
-// ======================================================================
-
 export default class DesktopWidgetsPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
-        let settings = this.getSettings();
+        let settings = this.getSettings(SETTINGS_SCHEMA);
 
         let page = new Adw.PreferencesPage({
             title: 'General',
