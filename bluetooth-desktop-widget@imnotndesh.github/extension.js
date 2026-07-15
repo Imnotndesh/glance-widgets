@@ -1,511 +1,324 @@
-/* extension.js
- *
- * Desktop Widgets
- * ----------------
- * A container that holds a stack of independent "desktop widgets"
- * (Bluetooth battery, weather, photos, clock, storage, ...). Which
- * widgets are shown, in what order, and each widget's own settings are
- * all driven by GSettings so prefs.js can be a generic list UI instead
- * of needing custom code per widget.
- *
- * Everything lives in this single file on purpose (no lib/ folder, no
- * external stylesheet), per extensions.gnome.org review requirements
- * about unreachable files.
- *
- * ---------------------------------------------------------------------
- * ADDING A NEW WIDGET
- * ---------------------------------------------------------------------
- * 1. Write a class implementing: build() -> St.Widget actor, refresh(),
- *    destroy(). See BluetoothWidget below for the reference shape.
- * 2. Register it in WIDGET_DEFS with a stable string id, display name,
- *    symbolic icon, and a factory that returns `new YourWidget(this)`.
- * 3. Add a matching entry to WIDGET_CATALOG in prefs.js (id/name/icon)
- *    so it shows up in the enable/reorder list, plus a settings group
- *    there if it needs configuration.
- * 4. If it needs its own settings, add gschema keys namespaced by widget
- *    id (e.g. "weather-api-key") — no changes to widgets-config needed,
- *    that key only tracks enabled/order, not per-widget config.
- * ---------------------------------------------------------------------
- */
-
-import St from 'gi://St';
-import Clutter from 'gi://Clutter';
-import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
-import Shell from 'gi://Shell';
+import GObject from 'gi://GObject';
+import Gvc from 'gi://Gvc';
 
-import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
+import { Extension, gettext as _ } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
+import { QuickToggle, SystemIndicator } from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
-const SETTINGS_SCHEMA = 'org.gnome.shell.extensions.bluetooth-desktop-widget';
-const SETTINGS_KEY_WIDGETS_CONFIG = 'widgets-config';
-
-// ======================================================================
-// Shared helpers
-// ======================================================================
-
-function unpackVariantDict(dict) {
-    let out = {};
-    for (let key in dict)
-        out[key] = dict[key].deep_unpack();
-    return out;
+function getStreamPortSafely(stream) {
+    const ports = stream.get_ports ? stream.get_ports() : [];
+    const hasPorts = Array.isArray(ports) && ports.length > 0;
+    const port = hasPorts ? stream.get_port() : null;
+    return { ports, hasPorts, port };
 }
 
-// Parse the widgets-config JSON, tolerating corruption/empty state by
-// falling back to a sane default rather than throwing.
-function loadWidgetsConfig(settings) {
-    let raw = settings.get_string(SETTINGS_KEY_WIDGETS_CONFIG);
-    try {
-        let parsed = JSON.parse(raw);
-        if (Array.isArray(parsed))
-            return parsed;
-    } catch (e) {
-        logError(e, 'Desktop Widgets: corrupt widgets-config, resetting');
-    }
-    return [{ id: 'bluetooth', enabled: true }];
+function classifyDeviceKind(stream) {
+    const name = (stream.get_name?.() ?? '').toLowerCase();
+    const { hasPorts, port } = getStreamPortSafely(stream);
+
+    if (!hasPorts) return 'virtual';
+
+    const portId = (port?.port ?? '').toLowerCase();
+    const portHuman = (port?.human_port ?? '').toLowerCase();
+    const isBluetooth = name.includes('bluez') || name.includes('bluetooth');
+    const looksLikeHeadphones =
+        portId.includes('headphone') ||
+        portId.includes('headset') ||
+        portHuman.includes('headphone') ||
+        portHuman.includes('headset') ||
+        name.includes('headphone');
+
+    if (isBluetooth) return 'bluetooth-headphones';
+    if (looksLikeHeadphones) return 'wired-headphones';
+    return 'speaker-or-other';
 }
 
-// ======================================================================
-// Bluetooth widget (reference implementation)
-// ======================================================================
-
-const BLUEZ_SERVICE = 'org.bluez';
-const OM_IFACE = 'org.freedesktop.DBus.ObjectManager';
-const PROPS_IFACE = 'org.freedesktop.DBus.Properties';
-const DEVICE_IFACE = 'org.bluez.Device1';
-const BATTERY_IFACE = 'org.bluez.Battery1';
-const SETTINGS_KEY_BT_STYLE = 'widget-style'; // "list" | "circles"
-
-const ICON_MAP = {
-    'audio-headset': 'audio-headphones-symbolic',
-    'audio-headphones': 'audio-headphones-symbolic',
-    'audio-card': 'audio-speakers-symbolic',
-    'input-gaming': 'input-gaming-symbolic',
-    'input-mouse': 'input-mouse-symbolic',
-    'input-keyboard': 'input-keyboard-symbolic',
-    'input-tablet': 'input-tablet-symbolic',
-    'phone': 'phone-symbolic',
-    'computer': 'computer-symbolic',
-};
-const FALLBACK_ICON = 'bluetooth-active-symbolic';
-
-function iconNameFor(hint) {
-    return ICON_MAP[hint] || FALLBACK_ICON;
+function isHeadphoneKind(kind) {
+    return kind === 'bluetooth-headphones' || kind === 'wired-headphones';
 }
 
-function batteryIconFor(percentage) {
-    let level = Math.max(0, Math.min(100, Math.round(percentage / 10) * 10));
-    return `battery-level-${level}-symbolic`;
+function extractBluetoothMac(stream) {
+    const name = stream.get_name?.() ?? '';
+    const match = name.match(/bluez_output\.([0-9A-Fa-f_]{17})\./);
+    if (!match) return null;
+    return match[1].replace(/_/g, ':').toUpperCase();
 }
 
-const RING_SIZE = 68;
-const RING_LINE_WIDTH = 5;
-
-function buildRingActor(percentage, iconName) {
-    let container = new St.Widget({
-        layout_manager: new Clutter.BinLayout(),
-        width: RING_SIZE,
-        height: RING_SIZE,
-    });
-
-    let area = new St.DrawingArea({ width: RING_SIZE, height: RING_SIZE });
-    area.connect('repaint', (a) => {
-        let cr = a.get_context();
-        let [w, h] = a.get_surface_size();
-        let cx = w / 2;
-        let cy = h / 2;
-        let radius = Math.min(w, h) / 2 - RING_LINE_WIDTH / 2 - 1;
-
-        cr.setSourceRGBA(1, 1, 1, 0.15);
-        cr.setLineWidth(RING_LINE_WIDTH);
-        cr.arc(cx, cy, radius, 0, 2 * Math.PI);
-        cr.stroke();
-
-        let fraction = Math.max(0, Math.min(1, (percentage || 0) / 100));
-        let startAngle = -Math.PI / 2;
-        let endAngle = startAngle + fraction * 2 * Math.PI;
-
-        cr.setSourceRGBA(0.20, 0.84, 0.29, 1);
-        cr.setLineWidth(RING_LINE_WIDTH);
-        cr.setLineCap(0);
-        cr.arc(cx, cy, radius, startAngle, endAngle);
-        cr.stroke();
-
-        cr.$dispose();
-    });
-
-    let icon = new St.Icon({
-        icon_name: iconName,
-        icon_size: 22,
-        x_align: Clutter.ActorAlign.CENTER,
-        y_align: Clutter.ActorAlign.CENTER,
-        style: 'color: rgba(255,255,255,0.92);',
-    });
-
-    container.add_child(area);
-    container.add_child(icon);
-    return container;
+function getDeviceId(stream, kind) {
+    if (kind === 'bluetooth-headphones') return extractBluetoothMac(stream);
+    if (kind === 'wired-headphones') return 'wired-jack';
+    return null;
 }
 
-function buildCircleCell(info) {
-    let cell = new St.BoxLayout({
-        vertical: true,
-        x_align: Clutter.ActorAlign.CENTER,
-        style: 'spacing: 6px; padding: 4px 10px;',
-    });
-
-    cell.add_child(buildRingActor(info.percentage, iconNameFor(info.icon)));
-
-    cell.add_child(new St.Label({
-        text: typeof info.percentage === 'number' ? `${info.percentage}%` : '—',
-        x_align: Clutter.ActorAlign.CENTER,
-        style: 'color: rgba(255,255,255,0.92); font-size: 15px; font-weight: 500;',
-    }));
-
-    return cell;
+function getDeviceLabel(stream) {
+    return stream.get_description?.() ?? stream.get_name?.() ?? 'Unknown device';
 }
 
-function buildListRow(info) {
-    let row = new St.BoxLayout({ style: 'padding: 8px 6px; spacing: 10px;' });
+const NOTIFICATION_SOURCE_TITLE = 'Headphone Volume Limiter';
 
-    row.add_child(new St.Icon({
-        icon_name: iconNameFor(info.icon),
-        icon_size: 22,
-        style: 'color: rgba(255,255,255,0.85);',
-    }));
-
-    row.add_child(new St.Label({
-        text: info.name,
-        y_align: Clutter.ActorAlign.CENTER,
-        style: 'color: rgba(255,255,255,0.92); font-size: 13px;',
-        x_expand: true,
-    }));
-
-    let battery = new St.BoxLayout({ y_align: Clutter.ActorAlign.CENTER, style: 'spacing: 4px;' });
-    if (typeof info.percentage === 'number') {
-        battery.add_child(new St.Icon({
-            icon_name: batteryIconFor(info.percentage),
-            icon_size: 16,
-            style: 'color: rgba(255,255,255,0.75);',
-        }));
-        battery.add_child(new St.Label({
-            text: `${info.percentage}%`,
-            y_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.65); font-size: 12px;',
-        }));
-    }
-    row.add_child(battery);
-
-    return row;
-}
-
-// A widget class implements: build() -> actor, refresh(), destroy().
-// The container (DesktopWidgetsExtension) owns positioning/layout of the
-// stack; each widget only owns its own internal content.
-class BluetoothWidget {
-    constructor(extension) {
-        this._extension = extension;
-        this._settings = extension.getSettings(SETTINGS_SCHEMA);
-        this._bus = Gio.DBus.system;
-        this._devices = new Map();
-        this._signalId = null;
-        this._settingsChangedId = null;
-    }
-
-    build() {
-        this._card = new St.BoxLayout({
-            vertical: true,
-            reactive: true,
-            style: `
-                background-color: rgba(28, 28, 30, 0.55);
-                border-radius: 20px;
-                border: 1px solid rgba(255,255,255,0.08);
-                padding: 14px;
-                min-width: 260px;
-            `,
+const HeadphoneLimiterToggle = GObject.registerClass(
+class HeadphoneLimiterToggle extends QuickToggle {
+    _init(settings) {
+        super._init({
+            title: _('Volume Limiter'),
+            iconName: 'audio-headphones-symbolic',
+            toggleMode: true,
         });
 
-        try {
-            this._card.add_effect(new Shell.BlurEffect({
-                brightness: 0.65,
-                sigma: 40,
-                mode: Shell.BlurMode.BACKGROUND,
-            }));
-        } catch (e) {
-            logError(e, 'Bluetooth widget: blur effect unavailable, using plain translucency');
-        }
-
-        this._card.add_child(new St.Label({
-            text: 'Bluetooth',
-            style: `
-                font-weight: 700;
-                font-size: 15px;
-                color: rgba(255,255,255,0.92);
-                padding-bottom: 8px;
-                padding-left: 4px;
-            `,
-        }));
-
-        this._contentBox = new St.Widget({ layout_manager: new Clutter.BinLayout() });
-        this._card.add_child(this._contentBox);
-
-        this._emptyLabel = new St.Label({
-            text: 'No devices connected',
-            style: 'color: rgba(255,255,255,0.5); font-size: 13px; padding: 6px 4px;',
-        });
-        this._card.add_child(this._emptyLabel);
-
-        this._settingsChangedId = this._settings.connect(
-            `changed::${SETTINGS_KEY_BT_STYLE}`,
-            () => this._redraw()
-        );
-
-        this._refreshFromBus();
-        this._subscribeToChanges();
-
-        return this._card;
-    }
-
-    refresh() {
-        this._refreshFromBus();
-    }
-
-    destroy() {
-        if (this._signalId !== null) {
-            this._bus.signal_unsubscribe(this._signalId);
-            this._signalId = null;
-        }
-        if (this._settingsChangedId !== null) {
-            this._settings.disconnect(this._settingsChangedId);
-            this._settingsChangedId = null;
-        }
-        this._card = null;
-        this._contentBox = null;
-        this._emptyLabel = null;
-    }
-
-    _redraw() {
-        if (!this._contentBox)
-            return;
-
-        this._contentBox.destroy_all_children();
-
-        let connected = [...this._devices.entries()].filter(([, info]) => info.connected);
-
-        if (connected.length === 0) {
-            this._emptyLabel.show();
-            this._contentBox.hide();
-            return;
-        }
-
-        this._emptyLabel.hide();
-        this._contentBox.show();
-
-        let style = this._settings.get_string(SETTINGS_KEY_BT_STYLE);
-
-        if (style === 'circles') {
-            let row = new St.BoxLayout({ style: 'spacing: 4px;' });
-            for (let [, info] of connected)
-                row.add_child(buildCircleCell(info));
-            this._contentBox.add_child(row);
-        } else {
-            let list = new St.BoxLayout({ vertical: true });
-            for (let [, info] of connected)
-                list.add_child(buildListRow(info));
-            this._contentBox.add_child(list);
-        }
-    }
-
-    _refreshFromBus() {
-        let result;
-        try {
-            result = this._bus.call_sync(
-                BLUEZ_SERVICE, '/', OM_IFACE, 'GetManagedObjects',
-                null, GLib.VariantType.new('(a{oa{sa{sv}}})'),
-                Gio.DBusCallFlags.NONE, -1, null
-            );
-        } catch (e) {
-            logError(e, 'Bluetooth widget: failed to reach BlueZ');
-            return;
-        }
-
-        let objects = result.deep_unpack()[0];
-
-        for (let path in objects) {
-            let ifaces = objects[path];
-            if (!(DEVICE_IFACE in ifaces))
-                continue;
-
-            let props = unpackVariantDict(ifaces[DEVICE_IFACE]);
-            let batteryProps = BATTERY_IFACE in ifaces
-                ? unpackVariantDict(ifaces[BATTERY_IFACE])
-                : null;
-
-            this._devices.set(path, {
-                name: props.Name || props.Alias || path,
-                icon: props.Icon || '',
-                connected: !!props.Connected,
-                percentage: batteryProps ? batteryProps.Percentage : undefined,
-            });
-        }
-
-        this._redraw();
-    }
-
-    _subscribeToChanges() {
-        this._signalId = this._bus.signal_subscribe(
-            BLUEZ_SERVICE, PROPS_IFACE, 'PropertiesChanged', null, null,
-            Gio.DBusSignalFlags.NONE,
-            (connection, sender, path, iface, signal, params) => {
-                let [changedIface, changedProps] = params.deep_unpack();
-                if (changedIface !== DEVICE_IFACE && changedIface !== BATTERY_IFACE)
-                    return;
-
-                let info = this._devices.get(path) || {
-                    name: path, icon: '', connected: false, percentage: undefined,
-                };
-
-                for (let key in changedProps) {
-                    let value = changedProps[key].deep_unpack();
-                    if (key === 'Connected') {
-                        info.connected = value;
-                        if (value)
-                            this._readBatteryOnce(path, info);
-                    } else if (key === 'Name' || key === 'Alias') {
-                        info.name = value;
-                    } else if (key === 'Icon') {
-                        info.icon = value;
-                    } else if (key === 'Percentage') {
-                        info.percentage = value;
-                    }
-                }
-
-                this._devices.set(path, info);
-                this._redraw();
-            }
+        this._settings = settings;
+        this._settings.bind(
+            'enabled',
+            this,
+            'checked',
+            Gio.SettingsBindFlags.DEFAULT
         );
     }
+});
 
-    _readBatteryOnce(path, info) {
-        try {
-            let result = this._bus.call_sync(
-                BLUEZ_SERVICE, path, PROPS_IFACE, 'Get',
-                new GLib.Variant('(ss)', [BATTERY_IFACE, 'Percentage']),
-                GLib.VariantType.new('(v)'),
-                Gio.DBusCallFlags.NONE, -1, null
-            );
-            info.percentage = result.deep_unpack()[0].deep_unpack();
-            this._devices.set(path, info);
-            this._redraw();
-        } catch (e) {
-            // Not exposed yet right after reconnect — will arrive via signal.
-        }
+const HeadphoneLimiterIndicator = GObject.registerClass(
+class HeadphoneLimiterIndicator extends SystemIndicator {
+    _init(settings) {
+        super._init();
+        this.quickSettingsItems.push(new HeadphoneLimiterToggle(settings));
     }
-}
+});
 
-// ======================================================================
-// Widget registry — add new widgets here
-// ======================================================================
-// Each entry: { name, icon, create(extension) -> widget instance }
-// The widget instance must implement build()/refresh()/destroy().
-
-const WIDGET_DEFS = {
-    bluetooth: {
-        name: 'Bluetooth',
-        icon: 'bluetooth-active-symbolic',
-        create: (extension) => new BluetoothWidget(extension),
-    },
-    // weather: { name: 'Weather', icon: 'weather-few-clouds-symbolic', create: (ext) => new WeatherWidget(ext) },
-    // photos:  { name: 'Photos',  icon: 'image-x-generic-symbolic',    create: (ext) => new PhotosWidget(ext) },
-    // clock:   { name: 'Clock',   icon: 'preferences-system-time-symbolic', create: (ext) => new ClockWidget(ext) },
-    // storage: { name: 'Storage', icon: 'drive-harddisk-symbolic',     create: (ext) => new StorageWidget(ext) },
-};
-
-// ======================================================================
-// Extension: owns the container, reads widgets-config, instantiates
-// enabled widgets in order, stacks their actors vertically.
-// ======================================================================
-
-export default class DesktopWidgetsExtension extends Extension {
+export default class HeadphoneVolumeLimiterExtension extends Extension {
     enable() {
-        this._settings = this.getSettings(SETTINGS_SCHEMA);
-        this._activeWidgets = []; // [{ id, instance }]
+        this._settings = this.getSettings();
 
-        this._container = new St.BoxLayout({
-            vertical: true,
-            style: 'spacing: 14px;',
-        });
+        this._indicator = new HeadphoneLimiterIndicator(this._settings);
+        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
-        Main.layoutManager._backgroundGroup.add_child(this._container);
-        this._container.set_position(
-            Main.layoutManager.primaryMonitor.width - 320,
-            60
+        this._notifSource = null;
+        this._notifSourceDestroyId = null;
+
+        this._sessionOverrides = new Set();
+        this._isClamping = false;
+
+        this._isReady = false;
+        this._streamHandlers = new Map();
+        this._activeStreamId = null;
+
+        this._control = new Gvc.MixerControl({ name: 'headphone-volume-limiter' });
+
+        this._control.connectObject(
+            'state-changed', (control, state) => {
+                if (state === Gvc.MixerControlState.READY) {
+                    this._isReady = true;
+                    this._attachAllStreams();
+                    this._onActiveOutputChanged(control.get_default_sink());
+                }
+            },
+            'output-added', (control, id) => {
+                if (!this._isReady) return;
+                const uiDevice = control.lookup_output_id(id);
+                if (!uiDevice) return;
+                const streamId = uiDevice.stream_id;
+                const stream = control.lookup_stream_id(streamId);
+                if (stream instanceof Gvc.MixerSink)
+                    this._attachStream(stream);
+            },
+            'output-removed', (control, id) => {
+                const uiDevice = control.lookup_output_id(id);
+                if (uiDevice)
+                    this._detachStreamById(uiDevice.stream_id);
+            },
+            'active-output-update', (control, id) => {
+                if (!this._isReady) return;
+                const stream = control.lookup_stream_id(id);
+                this._onActiveOutputChanged(stream);
+            },
+            this
         );
 
-        this._configChangedId = this._settings.connect(
-            `changed::${SETTINGS_KEY_WIDGETS_CONFIG}`,
-            () => this._rebuildWidgets()
-        );
+        this._control.open();
 
-        this._rebuildWidgets();
+        this._debug('enabled');
     }
 
     disable() {
-        if (this._configChangedId !== null) {
-            this._settings.disconnect(this._configChangedId);
-            this._configChangedId = null;
+        for (const { stream, id } of this._streamHandlers.values()) {
+            try { stream.disconnect(id); } catch (e) { }
+        }
+        this._streamHandlers.clear();
+
+        this._control?.disconnectObject(this);
+        this._control?.close();
+        this._control = null;
+
+        if (this._indicator) {
+            this._indicator.quickSettingsItems.forEach(item => item.destroy());
+            this._indicator.destroy();
+            this._indicator = null;
         }
 
-        this._destroyWidgets();
-
-        if (this._container) {
-            Main.layoutManager._backgroundGroup.remove_child(this._container);
-            this._container.destroy();
-            this._container = null;
+        if (this._notifSourceDestroyId) {
+            this._notifSource.disconnect(this._notifSourceDestroyId);
+            this._notifSourceDestroyId = null;
+        }
+        if (this._notifSource) {
+            this._notifSource.destroy();
+            this._notifSource = null;
         }
 
+        this._sessionOverrides.clear();
         this._settings = null;
+        delete global.headphoneLimiterDebug;
     }
 
-    _destroyWidgets() {
-        for (let { instance } of this._activeWidgets) {
-            try {
-                instance.destroy();
-            } catch (e) {
-                logError(e, 'Desktop Widgets: error destroying widget');
-            }
-        }
-        this._activeWidgets = [];
-        if (this._container)
-            this._container.destroy_all_children();
+    _debug(...args) {
+        if (global.headphoneLimiterDebug)
+            console.debug('[headphone-limiter]', ...args);
     }
 
-    _rebuildWidgets() {
-        this._destroyWidgets();
+    _attachAllStreams() {
+        const sinks = this._control.get_sinks();
+        for (const stream of sinks)
+            this._attachStream(stream);
+    }
 
-        let config = loadWidgetsConfig(this._settings);
+    _attachStream(stream) {
+        if (!stream) return;
+        const id = stream.get_id();
+        if (this._streamHandlers.has(id)) return;
 
-        for (let entry of config) {
-            if (!entry.enabled)
-                continue;
+        const handlerId = stream.connect('notify::volume', () => {
+            this._onStreamVolumeChanged(stream);
+        });
+        this._streamHandlers.set(id, { stream, id: handlerId });
+    }
 
-            let def = WIDGET_DEFS[entry.id];
-            if (!def) {
-                log(`Desktop Widgets: unknown widget id "${entry.id}" in config, skipping`);
-                continue;
-            }
-
-            let instance = def.create(this);
-            let actor;
-            try {
-                actor = instance.build();
-            } catch (e) {
-                logError(e, `Desktop Widgets: failed to build widget "${entry.id}"`);
-                continue;
-            }
-
-            this._container.add_child(actor);
-            this._activeWidgets.push({ id: entry.id, instance });
+    _detachStreamById(id) {
+        const entry = this._streamHandlers.get(id);
+        if (entry) {
+            try { entry.stream.disconnect(entry.id); } catch (e) { }
+            this._streamHandlers.delete(id);
         }
+        this._sessionOverrides.clear();
+    }
+
+    _onActiveOutputChanged(stream) {
+        if (!stream) {
+            this._activeStreamId = null;
+            return;
+        }
+        this._activeStreamId = stream.get_id();
+        this._onStreamVolumeChanged(stream);
+    }
+
+    _findConnectedHeadphoneStream() {
+        for (const { stream } of this._streamHandlers.values()) {
+            try {
+                const kind = classifyDeviceKind(stream);
+                if (isHeadphoneKind(kind)) return stream;
+            } catch (e) { }
+        }
+        return null;
+    }
+
+    _onStreamVolumeChanged(stream) {
+        if (this._isClamping) return;
+        if (!this._settings.get_boolean('enabled')) return;
+
+        if (stream.get_id() !== this._activeStreamId) return;
+
+        const kind = classifyDeviceKind(stream);
+        let effectiveDeviceId = getDeviceId(stream, kind);
+
+        if (!isHeadphoneKind(kind)) {
+            if (kind === 'virtual') {
+                const connectedHeadphone = this._findConnectedHeadphoneStream();
+                if (!connectedHeadphone) return;
+                this._debug('virtual stream proxying headphone', getDeviceLabel(connectedHeadphone));
+                effectiveDeviceId = getDeviceId(connectedHeadphone, classifyDeviceKind(connectedHeadphone));
+            } else {
+                return;
+            }
+        }
+
+        const deviceId = effectiveDeviceId;
+
+        const deviceMode = this._settings.get_string('device-mode');
+        if (deviceMode === 'specific') {
+            const target = this._settings.get_string('specific-device-id');
+            if (deviceId !== target) return;
+        }
+
+        if (deviceId && this._sessionOverrides.has(deviceId)) return;
+
+        const limitPercent = this._settings.get_int('limit-percent');
+        const maxNorm = this._control.get_vol_max_norm();
+        const limitVolume = Math.round((limitPercent / 100) * maxNorm);
+
+        const currentVolume = stream.get_volume();
+        if (currentVolume <= limitVolume) return;
+
+        const actionMode = this._settings.get_string('action-mode');
+        const label = getDeviceLabel(stream);
+
+        if (actionMode === 'warn-allow') {
+            this._notify(
+                `Volume above ${limitPercent}% on ${label}`,
+                'Allowed, but this exceeds your configured headphone limit.'
+            );
+            return;
+        }
+
+        this._clampVolume(stream, limitVolume);
+
+        if (actionMode === 'block') return;
+
+        this._notifyWithAllowAction(label, limitPercent, deviceId);
+    }
+
+    _clampVolume(stream, targetVolume) {
+        this._isClamping = true;
+        try {
+            stream.volume = targetVolume;
+            stream.push_volume();
+        } finally {
+            this._isClamping = false;
+        }
+    }
+
+    _getNotifSource() {
+        if (this._notifSource) return this._notifSource;
+
+        this._notifSource = new MessageTray.Source({
+            title: NOTIFICATION_SOURCE_TITLE,
+            iconName: 'audio-headphones-symbolic',
+        });
+        Main.messageTray.add(this._notifSource);
+        this._notifSourceDestroyId = this._notifSource.connect('destroy', () => {
+            this._notifSourceDestroyId = null;
+            this._notifSource = null;
+        });
+        return this._notifSource;
+    }
+
+    _notify(title, body) {
+        const source = this._getNotifSource();
+        const notification = new MessageTray.Notification({ source, title, body });
+        source.addNotification(notification);
+    }
+
+    _notifyWithAllowAction(deviceLabel, limitPercent, deviceId) {
+        const source = this._getNotifSource();
+        const notification = new MessageTray.Notification({
+            source,
+            title: `Volume limited to ${limitPercent}% on ${deviceLabel}`,
+            body: 'This device is capped by your headphone volume limiter.',
+        });
+
+        if (deviceId) {
+            notification.addAction('Allow louder for this session', () => {
+                this._sessionOverrides.add(deviceId);
+            });
+        }
+
+        source.addNotification(notification);
     }
 }
