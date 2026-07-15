@@ -19,8 +19,8 @@ const WIDGET_CATALOG = [
         id: 'weather',
         name: 'Weather',
         icon: 'weather-few-clouds-symbolic',
-        implemented: false,
-        buildSettings: null,
+        implemented: true,
+        buildSettings: buildWeatherSettingsGroup,
     },
     {
         id: 'photos',
@@ -79,7 +79,6 @@ function buildWidgetsListGroup(settings, window) {
     });
 
     function render() {
-        // Clear existing rows.
         for (let row of [...(group._rows || [])])
             group.remove(row);
         group._rows = [];
@@ -177,6 +176,31 @@ function buildBluetoothSettingsGroup(settings) {
     });
 
     group.add(row);
+    return group;
+}
+
+function buildWeatherSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Weather',
+        description: 'Powered by Open-Meteo — free, no API key required',
+    });
+
+    let row = new Adw.EntryRow({
+        title: 'Location',
+    });
+    row.set_text(settings.get_string('weather-location'));
+
+    row.connect('changed', () => {
+        settings.set_string('weather-location', row.get_text());
+    });
+
+    group.add(row);
+
+    let hint = new Adw.ActionRow({
+        subtitle: 'Enter a city name, e.g. "Berlin" or "Austin, US". Leave blank to default to London.',
+    });
+    group.add(hint);
+
     return group;
 }
 
