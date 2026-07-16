@@ -52,12 +52,18 @@
       <description>City name or lat,lon used to query the weather API.</description>
     </key>
 
-    <!-- Photos widget (Immich). Note: the API key is NOT stored here — it's
-         saved in the system keyring (libsecret) via extension.js/prefs.js,
-         keyed by instance URL, so it never sits in plaintext dconf. -->
+    <!-- Photos widget (Immich). The API key is preferably saved in the
+         system keyring (libsecret) via extension.js/prefs.js, keyed by
+         instance URL. If libsecret's GI typelib isn't installed on this
+         system, it falls back to storing the key here instead — less
+         secure, but keeps the widget working. -->
     <key name="photos-instance-url" type="s">
       <default>''</default>
       <summary>Immich instance URL</summary>
+    </key>
+    <key name="photos-api-key-plain" type="s">
+      <default>''</default>
+      <summary>Fallback plaintext storage for the Immich API key (used only if libsecret is unavailable)</summary>
     </key>
     <key name="photos-album-id" type="s">
       <default>''</default>

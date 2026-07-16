@@ -1,95 +1,291 @@
-import St from 'gi://St';
-import Clutter from 'gi://Clutter';
+import Adw from 'gi://Adw';
+import Gtk from 'gi://Gtk';
 import GLib from 'gi://GLib';
-import Gio from 'gi://Gio';
-import Shell from 'gi://Shell';
 import Soup from 'gi://Soup?version=3.0';
-import Secret from 'gi://Secret';
 
-import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
-import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
 const SETTINGS_SCHEMA = 'org.gnome.shell.extensions.bluetooth-desktop-widget';
 const SETTINGS_KEY_WIDGETS_CONFIG = 'widgets-config';
 
-function unpackVariantDict(dict) {
-    let out = {};
-    for (let key in dict)
-        out[key] = dict[key].deep_unpack();
-    return out;
+
+const WIDGET_CATALOG = [
+    {
+        id: 'bluetooth',
+        name: 'Bluetooth',
+        icon: 'bluetooth-active-symbolic',
+        implemented: true,
+        buildSettings: buildBluetoothSettingsGroup,
+    },
+    {
+        id: 'weather',
+        name: 'Weather',
+        icon: 'weather-few-clouds-symbolic',
+        implemented: true,
+        buildSettings: buildWeatherSettingsGroup,
+    },
+    {
+        id: 'photos',
+        name: 'Photos (Immich)',
+        icon: 'image-x-generic-symbolic',
+        implemented: true,
+        buildSettings: buildPhotosSettingsGroup,
+    },
+    {
+        id: 'clock',
+        name: 'Analog Clock',
+        icon: 'preferences-system-time-symbolic',
+        implemented: true,
+        buildSettings: null,
+    },
+    {
+        id: 'storage',
+        name: 'Storage',
+        icon: 'drive-harddisk-symbolic',
+        implemented: true,
+        buildSettings: buildStorageSettingsGroup,
+    },
+];
+
+function catalogEntry(id) {
+    return WIDGET_CATALOG.find((w) => w.id === id);
 }
 
-function loadWidgetsConfig(settings) {
+function loadConfig(settings) {
     let raw = settings.get_string(SETTINGS_KEY_WIDGETS_CONFIG);
+    let config = [];
     try {
         let parsed = JSON.parse(raw);
         if (Array.isArray(parsed))
-            return parsed;
+            config = parsed.filter((e) => catalogEntry(e.id));
     } catch (e) {
-        logError(e, 'Desktop Widgets: corrupt widgets-config, resetting');
+        logError(e, 'Desktop Widgets prefs: corrupt widgets-config, resetting');
     }
-    return [{ id: 'bluetooth', enabled: true }];
+
+    for (let entry of WIDGET_CATALOG) {
+        if (!config.some((e) => e.id === entry.id))
+            config.push({ id: entry.id, enabled: false });
+    }
+
+    return config;
 }
 
-let _httpSession = null;
-function getHttpSession() {
-    if (!_httpSession) {
-        _httpSession = new Soup.Session();
-        _httpSession.timeout = 12;
-        _httpSession.user_agent = 'gnome-shell-bluetooth-desktop-widget/1.0';
-    }
-    return _httpSession;
+function saveConfig(settings, config) {
+    settings.set_string(SETTINGS_KEY_WIDGETS_CONFIG, JSON.stringify(config));
 }
 
-function destroyHttpSession() {
-    if (_httpSession) {
-        _httpSession.abort();
-        _httpSession = null;
+function buildWidgetsListGroup(settings, window) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Widgets',
+        description: 'Choose which widgets appear on the desktop and in what order',
+    });
+
+    function render() {
+        for (let row of [...(group._rows || [])])
+            group.remove(row);
+        group._rows = [];
+
+        let config = loadConfig(settings);
+
+        config.forEach((entry, index) => {
+            let meta = catalogEntry(entry.id);
+
+            let row = new Adw.ActionRow({
+                title: meta.name,
+                subtitle: meta.implemented ? '' : 'Coming soon',
+                sensitive: meta.implemented,
+            });
+            row.add_prefix(new Gtk.Image({ icon_name: meta.icon, pixel_size: 20 }));
+
+            let controls = new Gtk.Box({
+                orientation: Gtk.Orientation.HORIZONTAL,
+                spacing: 6,
+                valign: Gtk.Align.CENTER,
+            });
+
+            let upButton = new Gtk.Button({
+                icon_name: 'go-up-symbolic',
+                valign: Gtk.Align.CENTER,
+                sensitive: meta.implemented && index > 0,
+                css_classes: ['flat'],
+            });
+            upButton.connect('clicked', () => {
+                let cfg = loadConfig(settings);
+                [cfg[index - 1], cfg[index]] = [cfg[index], cfg[index - 1]];
+                saveConfig(settings, cfg);
+                render();
+            });
+
+            let downButton = new Gtk.Button({
+                icon_name: 'go-down-symbolic',
+                valign: Gtk.Align.CENTER,
+                sensitive: meta.implemented && index < config.length - 1,
+                css_classes: ['flat'],
+            });
+            downButton.connect('clicked', () => {
+                let cfg = loadConfig(settings);
+                [cfg[index], cfg[index + 1]] = [cfg[index + 1], cfg[index]];
+                saveConfig(settings, cfg);
+                render();
+            });
+
+            let toggle = new Gtk.Switch({
+                active: entry.enabled,
+                valign: Gtk.Align.CENTER,
+                sensitive: meta.implemented,
+            });
+            toggle.connect('notify::active', () => {
+                let cfg = loadConfig(settings);
+                cfg[index].enabled = toggle.active;
+                saveConfig(settings, cfg);
+            });
+
+            controls.append(upButton);
+            controls.append(downButton);
+            controls.append(toggle);
+            row.add_suffix(controls);
+            row.activatable_widget = toggle;
+
+            group.add(row);
+            group._rows.push(row);
+        });
     }
+
+    group._rows = [];
+    render();
+
+    return group;
 }
 
-function fetchJson(url) {
-    return new Promise((resolve, reject) => {
-        let message = Soup.Message.new('GET', url);
-        if (!message) {
-            reject(new Error(`Invalid URL: ${url}`));
-            return;
-        }
 
-        getHttpSession().send_and_read_async(
-            message, GLib.PRIORITY_DEFAULT, null,
-            (session, result) => {
+function buildBluetoothSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Bluetooth',
+        description: 'Configure the Bluetooth widget',
+    });
+
+    let row = new Adw.ComboRow({
+        title: 'Widget style',
+        subtitle: '"Circles" mimics the iOS battery widget look',
+        model: new Gtk.StringList({ strings: ['List', 'Circles'] }),
+    });
+
+    let current = settings.get_string('widget-style');
+    row.selected = current === 'list' ? 0 : 1;
+
+    row.connect('notify::selected', () => {
+        settings.set_string('widget-style', row.selected === 0 ? 'list' : 'circles');
+    });
+
+    group.add(row);
+    return group;
+}
+
+function buildWeatherSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Weather',
+        description: 'Powered by Open-Meteo — free, no API key required',
+    });
+
+    let row = new Adw.EntryRow({
+        title: 'Location',
+    });
+    row.set_text(settings.get_string('weather-location'));
+
+    row.connect('changed', () => {
+        settings.set_string('weather-location', row.get_text());
+    });
+
+    group.add(row);
+
+    let hint = new Adw.ActionRow({
+        subtitle: 'Enter a city name, e.g. "Berlin" or "Austin, US". Leave blank to default to London.',
+    });
+    group.add(hint);
+
+    return group;
+}
+
+// libsecret's GI typelib (gir1.2-secret-1 / typelib for Secret-1) is not
+// guaranteed to be present on every system. Importing it eagerly at module
+// scope means a missing typelib crashes the *entire* prefs process before
+// fillPreferencesWindow ever runs — which GNOME then reports as a confusing,
+// unrelated "resource:///org/gnome/shell/extensions/extension.js" error.
+// Loading it lazily, and falling back to (less secure) GSettings storage if
+// it's unavailable, keeps the widget usable everywhere.
+let _secretModulePromise = null;
+function getSecretModule() {
+    if (!_secretModulePromise) {
+        _secretModulePromise = import('gi://Secret')
+            .then((m) => m.default)
+            .catch((e) => {
+                logError(e, 'Desktop Widgets prefs: libsecret unavailable, falling back to GSettings storage for the Immich API key');
+                return null;
+            });
+    }
+    return _secretModulePromise;
+}
+
+let _photosSecretSchema = null;
+async function getPhotosSecretSchema() {
+    let Secret = await getSecretModule();
+    if (!Secret)
+        return null;
+    if (!_photosSecretSchema) {
+        _photosSecretSchema = new Secret.Schema(
+            'org.gnome.shell.extensions.bluetooth-desktop-widget.photos',
+            Secret.SchemaFlags.NONE,
+            { 'instance-url': Secret.SchemaAttributeType.STRING }
+        );
+    }
+    return _photosSecretSchema;
+}
+
+async function storeApiKey(instanceUrl, apiKey, settings) {
+    let Secret = await getSecretModule();
+    let schema = await getPhotosSecretSchema();
+
+    if (!Secret || !schema) {
+        // Fallback: keep it in GSettings so the feature still works.
+        settings.set_string('photos-api-key-plain', apiKey);
+        return;
+    }
+
+    await new Promise((resolve) => {
+        Secret.password_store(
+            schema,
+            { 'instance-url': instanceUrl },
+            Secret.COLLECTION_DEFAULT,
+            'Immich API Key',
+            apiKey,
+            null,
+            (source, result) => {
                 try {
-                    let bytes = session.send_and_read_finish(result);
-                    let status = message.get_status();
-                    if (status !== Soup.Status.OK) {
-                        reject(new Error(`HTTP ${status}`));
-                        return;
-                    }
-                    let text = new TextDecoder('utf-8').decode(bytes.get_data());
-                    resolve(JSON.parse(text));
+                    Secret.password_store_finish(result);
+                    settings.set_string('photos-api-key-plain', '');
                 } catch (e) {
-                    reject(e);
+                    logError(e, 'Desktop Widgets prefs: failed to store Immich API key in keyring, falling back to GSettings');
+                    settings.set_string('photos-api-key-plain', apiKey);
                 }
+                resolve();
             }
         );
     });
 }
 
-const PHOTOS_SECRET_SCHEMA = new Secret.Schema(
-    'org.gnome.shell.extensions.bluetooth-desktop-widget.photos',
-    Secret.SchemaFlags.NONE,
-    { 'instance-url': Secret.SchemaAttributeType.STRING }
-);
+async function lookupApiKey(instanceUrl, settings) {
+    if (!instanceUrl)
+        return settings.get_string('photos-api-key-plain') || null;
 
-function lookupApiKey(instanceUrl) {
+    let Secret = await getSecretModule();
+    let schema = await getPhotosSecretSchema();
+
+    if (!Secret || !schema)
+        return settings.get_string('photos-api-key-plain') || null;
+
     return new Promise((resolve) => {
-        if (!instanceUrl) {
-            resolve(null);
-            return;
-        }
         Secret.password_lookup(
-            PHOTOS_SECRET_SCHEMA,
+            schema,
             { 'instance-url': instanceUrl },
             null,
             (source, result) => {
@@ -97,1427 +293,311 @@ function lookupApiKey(instanceUrl) {
                 try {
                     apiKey = Secret.password_lookup_finish(result);
                 } catch (e) {
-                    logError(e, 'Desktop Widgets: failed to look up Immich API key');
+                    logError(e, 'Desktop Widgets prefs: failed to look up Immich API key');
                 }
-                resolve(apiKey);
+                resolve(apiKey || settings.get_string('photos-api-key-plain') || null);
             }
         );
     });
 }
 
-function fetchJsonAuth(url, apiKey) {
-    return new Promise((resolve, reject) => {
-        let message = Soup.Message.new('GET', url);
-        if (!message) {
-            reject(new Error(`Invalid URL: ${url}`));
-            return;
-        }
-        message.request_headers.append('x-api-key', apiKey);
-
-        getHttpSession().send_and_read_async(
-            message, GLib.PRIORITY_DEFAULT, null,
-            (session, result) => {
-                try {
-                    let bytes = session.send_and_read_finish(result);
-                    let status = message.get_status();
-                    if (status !== Soup.Status.OK) {
-                        reject(new Error(`HTTP ${status}`));
-                        return;
-                    }
-                    let text = new TextDecoder('utf-8').decode(bytes.get_data());
-                    resolve(JSON.parse(text));
-                } catch (e) {
-                    reject(e);
-                }
-            }
-        );
-    });
-}
-
-function fetchBytesAuth(url, apiKey) {
-    return new Promise((resolve, reject) => {
-        let message = Soup.Message.new('GET', url);
-        if (!message) {
-            reject(new Error(`Invalid URL: ${url}`));
-            return;
-        }
-        message.request_headers.append('x-api-key', apiKey);
-
-        getHttpSession().send_and_read_async(
-            message, GLib.PRIORITY_DEFAULT, null,
-            (session, result) => {
-                try {
-                    let bytes = session.send_and_read_finish(result);
-                    let status = message.get_status();
-                    if (status !== Soup.Status.OK) {
-                        reject(new Error(`HTTP ${status}`));
-                        return;
-                    }
-                    resolve(bytes);
-                } catch (e) {
-                    reject(e);
-                }
-            }
-        );
-    });
-}
-
-const BLUEZ_SERVICE = 'org.bluez';
-const OM_IFACE = 'org.freedesktop.DBus.ObjectManager';
-const PROPS_IFACE = 'org.freedesktop.DBus.Properties';
-const DEVICE_IFACE = 'org.bluez.Device1';
-const BATTERY_IFACE = 'org.bluez.Battery1';
-const SETTINGS_KEY_BT_STYLE = 'widget-style';
-
-const ICON_MAP = {
-    'audio-headset': 'audio-headphones-symbolic',
-    'audio-headphones': 'audio-headphones-symbolic',
-    'audio-card': 'audio-speakers-symbolic',
-    'input-gaming': 'input-gaming-symbolic',
-    'input-mouse': 'input-mouse-symbolic',
-    'input-keyboard': 'input-keyboard-symbolic',
-    'input-tablet': 'input-tablet-symbolic',
-    'phone': 'phone-symbolic',
-    'computer': 'computer-symbolic',
-};
-const FALLBACK_ICON = 'bluetooth-active-symbolic';
-
-function iconNameFor(hint) {
-    return ICON_MAP[hint] || FALLBACK_ICON;
-}
-
-function batteryIconFor(percentage) {
-    let level = Math.max(0, Math.min(100, Math.round(percentage / 10) * 10));
-    return `battery-level-${level}-symbolic`;
-}
-
-const RING_SIZE = 68;
-const RING_LINE_WIDTH = 5;
-
-function buildRingActor(percentage, iconName) {
-    let container = new St.Widget({
-        layout_manager: new Clutter.BinLayout(),
-        width: RING_SIZE,
-        height: RING_SIZE,
-    });
-
-    let area = new St.DrawingArea({ width: RING_SIZE, height: RING_SIZE });
-    area.connect('repaint', (a) => {
-        let cr = a.get_context();
-        let [w, h] = a.get_surface_size();
-        let cx = w / 2;
-        let cy = h / 2;
-        let radius = Math.min(w, h) / 2 - RING_LINE_WIDTH / 2 - 1;
-
-        cr.setSourceRGBA(1, 1, 1, 0.15);
-        cr.setLineWidth(RING_LINE_WIDTH);
-        cr.arc(cx, cy, radius, 0, 2 * Math.PI);
-        cr.stroke();
-
-        let fraction = Math.max(0, Math.min(1, (percentage || 0) / 100));
-        let startAngle = -Math.PI / 2;
-        let endAngle = startAngle + fraction * 2 * Math.PI;
-
-        cr.setSourceRGBA(0.20, 0.84, 0.29, 1);
-        cr.setLineWidth(RING_LINE_WIDTH);
-        cr.setLineCap(0);
-        cr.arc(cx, cy, radius, startAngle, endAngle);
-        cr.stroke();
-
-        cr.$dispose();
-    });
-
-    let icon = new St.Icon({
-        icon_name: iconName,
-        icon_size: 22,
-        x_align: Clutter.ActorAlign.CENTER,
-        y_align: Clutter.ActorAlign.CENTER,
-        style: 'color: rgba(255,255,255,0.92);',
-    });
-
-    container.add_child(area);
-    container.add_child(icon);
-    return container;
-}
-
-function buildCircleCell(info) {
-    let cell = new St.BoxLayout({
-        vertical: true,
-        x_align: Clutter.ActorAlign.CENTER,
-        style: 'spacing: 6px; padding: 4px 10px;',
-    });
-
-    cell.add_child(buildRingActor(info.percentage, iconNameFor(info.icon)));
-
-    cell.add_child(new St.Label({
-        text: typeof info.percentage === 'number' ? `${info.percentage}%` : '—',
-        x_align: Clutter.ActorAlign.CENTER,
-        style: 'color: rgba(255,255,255,0.92); font-size: 15px; font-weight: 500;',
-    }));
-
-    return cell;
-}
-
-function buildListRow(info) {
-    let row = new St.BoxLayout({ style: 'padding: 8px 6px; spacing: 10px;' });
-
-    row.add_child(new St.Icon({
-        icon_name: iconNameFor(info.icon),
-        icon_size: 22,
-        style: 'color: rgba(255,255,255,0.85);',
-    }));
-
-    row.add_child(new St.Label({
-        text: info.name,
-        y_align: Clutter.ActorAlign.CENTER,
-        style: 'color: rgba(255,255,255,0.92); font-size: 13px;',
-        x_expand: true,
-    }));
-
-    let battery = new St.BoxLayout({ y_align: Clutter.ActorAlign.CENTER, style: 'spacing: 4px;' });
-    if (typeof info.percentage === 'number') {
-        battery.add_child(new St.Icon({
-            icon_name: batteryIconFor(info.percentage),
-            icon_size: 16,
-            style: 'color: rgba(255,255,255,0.75);',
-        }));
-        battery.add_child(new St.Label({
-            text: `${info.percentage}%`,
-            y_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.65); font-size: 12px;',
-        }));
+function immichRequest(url, apiKey, callback) {
+    let session = new Soup.Session();
+    session.timeout = 10;
+    let message = Soup.Message.new('GET', url);
+    if (!message) {
+        callback(false, `Invalid URL: ${url}`);
+        return;
     }
-    row.add_child(battery);
+    message.request_headers.append('x-api-key', apiKey);
+    message.request_headers.append('Accept', 'application/json');
 
-    return row;
-}
-
-const WEATHER_CODE_MAP = {
-    0: { icon: 'weather-clear', label: 'Clear sky' },
-    1: { icon: 'weather-few-clouds', label: 'Mostly clear' },
-    2: { icon: 'weather-few-clouds', label: 'Partly cloudy' },
-    3: { icon: 'weather-overcast', label: 'Overcast' },
-    45: { icon: 'weather-fog', label: 'Fog' },
-    48: { icon: 'weather-fog', label: 'Rime fog' },
-    51: { icon: 'weather-showers-scattered', label: 'Light drizzle' },
-    53: { icon: 'weather-showers-scattered', label: 'Drizzle' },
-    55: { icon: 'weather-showers', label: 'Dense drizzle' },
-    56: { icon: 'weather-showers-scattered', label: 'Freezing drizzle' },
-    57: { icon: 'weather-showers', label: 'Freezing drizzle' },
-    61: { icon: 'weather-showers-scattered', label: 'Light rain' },
-    63: { icon: 'weather-showers', label: 'Rain' },
-    65: { icon: 'weather-showers', label: 'Heavy rain' },
-    66: { icon: 'weather-showers', label: 'Freezing rain' },
-    67: { icon: 'weather-showers', label: 'Freezing rain' },
-    71: { icon: 'weather-snow', label: 'Light snow' },
-    73: { icon: 'weather-snow', label: 'Snow' },
-    75: { icon: 'weather-snow', label: 'Heavy snow' },
-    77: { icon: 'weather-snow', label: 'Snow grains' },
-    80: { icon: 'weather-showers-scattered', label: 'Light showers' },
-    81: { icon: 'weather-showers', label: 'Showers' },
-    82: { icon: 'weather-showers', label: 'Violent showers' },
-    85: { icon: 'weather-snow', label: 'Snow showers' },
-    86: { icon: 'weather-snow', label: 'Heavy snow showers' },
-    95: { icon: 'weather-storm', label: 'Thunderstorm' },
-    96: { icon: 'weather-storm', label: 'Thunderstorm, hail' },
-    99: { icon: 'weather-storm', label: 'Thunderstorm, hail' },
-};
-
-function weatherInfoFor(code, isDay) {
-    let entry = WEATHER_CODE_MAP[code] || { icon: 'weather-severe-alert', label: 'Unknown' };
-    let iconName = entry.icon;
-    if (iconName === 'weather-clear')
-        iconName = isDay ? 'weather-clear-symbolic' : 'weather-clear-night-symbolic';
-    else if (iconName === 'weather-few-clouds')
-        iconName = isDay ? 'weather-few-clouds-symbolic' : 'weather-few-clouds-night-symbolic';
-    else
-        iconName = `${iconName}-symbolic`;
-
-    return { icon: iconName, label: entry.label };
-}
-
-class WeatherWidget {
-    constructor(extension) {
-        this._extension = extension;
-        this._settings = extension.getSettings(SETTINGS_SCHEMA);
-        this._settingsChangedId = null;
-        this._refreshTimeoutId = null;
-        this._destroyed = false;
-        this._coords = null;
-        this._lastLocationQuery = null;
-    }
-
-    build() {
-        this._card = new St.BoxLayout({
-            vertical: true,
-            reactive: true,
-            style: `
-                background-color: rgba(28, 28, 30, 0.55);
-                border-radius: 20px;
-                border: 1px solid rgba(255,255,255,0.08);
-                padding: 14px;
-                min-width: 260px;
-            `,
-        });
-
+    session.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session_, result) => {
         try {
-            this._card.add_effect(new Shell.BlurEffect({
-                brightness: 0.65,
-                sigma: 40,
-                mode: Shell.BlurMode.BACKGROUND,
-            }));
-        } catch (e) {
-            logError(e, 'Weather widget: blur effect unavailable, using plain translucency');
-        }
-
-        this._headerLabel = new St.Label({
-            text: 'Weather',
-            style: `
-                font-weight: 700;
-                font-size: 15px;
-                color: rgba(255,255,255,0.92);
-                padding-bottom: 8px;
-                padding-left: 4px;
-            `,
-        });
-        this._card.add_child(this._headerLabel);
-
-        this._contentBox = new St.Widget({ layout_manager: new Clutter.BinLayout() });
-        this._card.add_child(this._contentBox);
-
-        this._statusLabel = new St.Label({
-            text: 'Loading…',
-            style: 'color: rgba(255,255,255,0.5); font-size: 13px; padding: 6px 4px;',
-        });
-        this._card.add_child(this._statusLabel);
-
-        this._settingsChangedId = this._settings.connect(
-            'changed::weather-location',
-            () => this.refresh()
-        );
-
-        this.refresh();
-        this._scheduleAutoRefresh();
-
-        return this._card;
-    }
-
-    refresh() {
-        this._refreshFromApi().catch((e) => {
-            logError(e, 'Weather widget: refresh failed');
-            this._showStatus('Unable to load weather');
-        });
-    }
-
-    destroy() {
-        this._destroyed = true;
-        if (this._settingsChangedId !== null) {
-            this._settings.disconnect(this._settingsChangedId);
-            this._settingsChangedId = null;
-        }
-        if (this._refreshTimeoutId !== null) {
-            GLib.source_remove(this._refreshTimeoutId);
-            this._refreshTimeoutId = null;
-        }
-        this._card = null;
-        this._contentBox = null;
-        this._statusLabel = null;
-        this._headerLabel = null;
-    }
-
-    _scheduleAutoRefresh() {
-        this._refreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 900, () => {
-            this.refresh();
-            return GLib.SOURCE_CONTINUE;
-        });
-    }
-
-    _showStatus(text) {
-        if (!this._statusLabel)
-            return;
-        this._contentBox.hide();
-        this._statusLabel.text = text;
-        this._statusLabel.show();
-    }
-
-    async _refreshFromApi() {
-        let location = this._settings.get_string('weather-location').trim() || 'London';
-
-        if (location !== this._lastLocationQuery || !this._coords) {
-            this._showStatus('Loading…');
-            let geo = await fetchJson(
-                `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en&format=json`
-            );
-
-            if (this._destroyed)
+            let bytes = session_.send_and_read_finish(result);
+            let status = message.get_status();
+            if (status !== Soup.Status.OK) {
+                callback(false, `Server responded with HTTP ${status}`);
                 return;
+            }
+            let text = new TextDecoder('utf-8').decode(bytes.get_data());
+            callback(true, JSON.parse(text));
+        } catch (e) {
+            callback(false, e.message);
+        }
+    });
+}
 
-            let result = geo.results && geo.results[0];
-            if (!result) {
-                this._showStatus(`Location "${location}" not found`);
+function testImmichConnection(url, apiKey, callback) {
+    immichRequest(`${url}/api/users/me`, apiKey, (ok, data) => {
+        if (!ok) {
+            callback(false, data);
+            return;
+        }
+        callback(true, data.name || data.email || 'user');
+    });
+}
+
+function fetchImmichAlbums(url, apiKey, callback) {
+    immichRequest(`${url}/api/albums`, apiKey, (ok, data) => {
+        if (!ok) {
+            callback(false, data);
+            return;
+        }
+        callback(true, data);
+    });
+}
+
+function buildPhotosSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Photos (Immich)',
+        description: 'Connect to your Immich server and choose an album to display',
+    });
+
+    let urlRow = new Adw.EntryRow({ title: 'Server URL' });
+    urlRow.set_text(settings.get_string('photos-instance-url'));
+    group.add(urlRow);
+
+    let keyRow = new Adw.PasswordEntryRow({ title: 'API Key' });
+    group.add(keyRow);
+
+    let existingUrl = settings.get_string('photos-instance-url');
+    if (existingUrl) {
+        lookupApiKey(existingUrl, settings).then((key) => {
+            if (key)
+                keyRow.set_text(key);
+        });
+    }
+
+    let statusRow = new Adw.ActionRow({ title: 'Status', subtitle: 'Not connected' });
+    group.add(statusRow);
+
+    let testButton = new Gtk.Button({
+        label: 'Test Connection',
+        valign: Gtk.Align.CENTER,
+        css_classes: ['suggested-action'],
+    });
+    let testRow = new Adw.ActionRow({ title: 'Connect' });
+    testRow.add_suffix(testButton);
+    testRow.activatable_widget = testButton;
+    group.add(testRow);
+
+    let albumComboRow = new Adw.ComboRow({
+        title: 'Album',
+        subtitle: 'Shown as a slideshow on the desktop widget',
+        visible: false,
+    });
+    group.add(albumComboRow);
+
+    let albumsData = [];
+    let suppressAlbumSignal = false;
+
+    function populateAlbums(url, apiKey) {
+        statusRow.subtitle = 'Loading albums…';
+        fetchImmichAlbums(url, apiKey, (ok, albumsOrError) => {
+            if (!ok) {
+                statusRow.subtitle = `Connected, but failed to load albums: ${albumsOrError}`;
+                return;
+            }
+            if (albumsOrError.length === 0) {
+                statusRow.subtitle = 'Connected — no albums found on this server';
+                albumComboRow.visible = false;
                 return;
             }
 
-            this._coords = {
-                latitude: result.latitude,
-                longitude: result.longitude,
-                name: result.name,
-                admin1: result.admin1,
-                country: result.country_code,
-            };
-            this._lastLocationQuery = location;
-        }
+            statusRow.subtitle = 'Connected';
+            albumsData = albumsOrError;
 
-        let { latitude, longitude } = this._coords;
-        let forecast = await fetchJson(
-            'https://api.open-meteo.com/v1/forecast' +
-            `?latitude=${latitude}&longitude=${longitude}` +
-            '&current=temperature_2m,weather_code,is_day' +
-            '&daily=temperature_2m_max,temperature_2m_min' +
-            '&temperature_unit=celsius&timezone=auto'
-        );
-
-        if (this._destroyed)
-            return;
-
-        let current = forecast.current;
-        let daily = forecast.daily;
-
-        this._renderWeather({
-            temp: Math.round(current.temperature_2m),
-            high: Math.round(daily.temperature_2m_max[0]),
-            low: Math.round(daily.temperature_2m_min[0]),
-            code: current.weather_code,
-            isDay: !!current.is_day,
-            place: this._coords.name,
-        });
-    }
-
-    _renderWeather(data) {
-        if (!this._contentBox)
-            return;
-
-        this._statusLabel.hide();
-        this._contentBox.show();
-        this._contentBox.destroy_all_children();
-
-        let info = weatherInfoFor(data.code, data.isDay);
-
-        let cell = new St.BoxLayout({
-            vertical: true,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'spacing: 2px; padding: 4px 10px 8px 10px;',
-        });
-
-        let iconRow = new St.BoxLayout({
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'spacing: 8px;',
-        });
-        iconRow.add_child(new St.Icon({
-            icon_name: info.icon,
-            icon_size: 34,
-            style: 'color: rgba(255,255,255,0.92);',
-        }));
-        iconRow.add_child(new St.Label({
-            text: `${data.temp}°`,
-            y_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.92); font-size: 34px; font-weight: 300;',
-        }));
-        cell.add_child(iconRow);
-
-        cell.add_child(new St.Label({
-            text: data.place,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.85); font-size: 13px; font-weight: 500; padding-top: 2px;',
-        }));
-
-        cell.add_child(new St.Label({
-            text: info.label,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.6); font-size: 12px;',
-        }));
-
-        cell.add_child(new St.Label({
-            text: `H:${data.high}°  L:${data.low}°`,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.6); font-size: 12px; padding-top: 2px;',
-        }));
-
-        this._contentBox.add_child(cell);
-    }
-}
-
-class BluetoothWidget {
-    constructor(extension) {
-        this._extension = extension;
-        this._settings = extension.getSettings(SETTINGS_SCHEMA);
-        this._bus = Gio.DBus.system;
-        this._devices = new Map();
-        this._signalId = null;
-        this._settingsChangedId = null;
-    }
-
-    build() {
-        this._card = new St.BoxLayout({
-            vertical: true,
-            reactive: true,
-            style: `
-                background-color: rgba(28, 28, 30, 0.55);
-                border-radius: 20px;
-                border: 1px solid rgba(255,255,255,0.08);
-                padding: 14px;
-                min-width: 260px;
-            `,
-        });
-
-        try {
-            this._card.add_effect(new Shell.BlurEffect({
-                brightness: 0.65,
-                sigma: 40,
-                mode: Shell.BlurMode.BACKGROUND,
-            }));
-        } catch (e) {
-            logError(e, 'Bluetooth widget: blur effect unavailable, using plain translucency');
-        }
-
-        this._card.add_child(new St.Label({
-            text: 'Bluetooth',
-            style: `
-                font-weight: 700;
-                font-size: 15px;
-                color: rgba(255,255,255,0.92);
-                padding-bottom: 8px;
-                padding-left: 4px;
-            `,
-        }));
-
-        this._contentBox = new St.Widget({ layout_manager: new Clutter.BinLayout() });
-        this._card.add_child(this._contentBox);
-
-        this._emptyLabel = new St.Label({
-            text: 'No devices connected',
-            style: 'color: rgba(255,255,255,0.5); font-size: 13px; padding: 6px 4px;',
-        });
-        this._card.add_child(this._emptyLabel);
-
-        this._settingsChangedId = this._settings.connect(
-            `changed::${SETTINGS_KEY_BT_STYLE}`,
-            () => this._redraw()
-        );
-
-        this._refreshFromBus();
-        this._subscribeToChanges();
-
-        return this._card;
-    }
-
-    refresh() {
-        this._refreshFromBus();
-    }
-
-    destroy() {
-        if (this._signalId !== null) {
-            this._bus.signal_unsubscribe(this._signalId);
-            this._signalId = null;
-        }
-        if (this._settingsChangedId !== null) {
-            this._settings.disconnect(this._settingsChangedId);
-            this._settingsChangedId = null;
-        }
-        this._card = null;
-        this._contentBox = null;
-        this._emptyLabel = null;
-    }
-
-    _redraw() {
-        if (!this._contentBox)
-            return;
-
-        this._contentBox.destroy_all_children();
-
-        let connected = [...this._devices.entries()].filter(([, info]) => info.connected);
-
-        if (connected.length === 0) {
-            this._emptyLabel.show();
-            this._contentBox.hide();
-            return;
-        }
-
-        this._emptyLabel.hide();
-        this._contentBox.show();
-
-        let style = this._settings.get_string(SETTINGS_KEY_BT_STYLE);
-
-        if (style === 'circles') {
-            let row = new St.BoxLayout({ style: 'spacing: 4px;' });
-            for (let [, info] of connected)
-                row.add_child(buildCircleCell(info));
-            this._contentBox.add_child(row);
-        } else {
-            let list = new St.BoxLayout({ vertical: true });
-            for (let [, info] of connected)
-                list.add_child(buildListRow(info));
-            this._contentBox.add_child(list);
-        }
-    }
-
-    _refreshFromBus() {
-        let result;
-        try {
-            result = this._bus.call_sync(
-                BLUEZ_SERVICE, '/', OM_IFACE, 'GetManagedObjects',
-                null, GLib.VariantType.new('(a{oa{sa{sv}}})'),
-                Gio.DBusCallFlags.NONE, -1, null
-            );
-        } catch (e) {
-            logError(e, 'Bluetooth widget: failed to reach BlueZ');
-            return;
-        }
-
-        let objects = result.deep_unpack()[0];
-
-        for (let path in objects) {
-            let ifaces = objects[path];
-            if (!(DEVICE_IFACE in ifaces))
-                continue;
-
-            let props = unpackVariantDict(ifaces[DEVICE_IFACE]);
-            let batteryProps = BATTERY_IFACE in ifaces
-                ? unpackVariantDict(ifaces[BATTERY_IFACE])
-                : null;
-
-            this._devices.set(path, {
-                name: props.Name || props.Alias || path,
-                icon: props.Icon || '',
-                connected: !!props.Connected,
-                percentage: batteryProps ? batteryProps.Percentage : undefined,
+            suppressAlbumSignal = true;
+            albumComboRow.model = new Gtk.StringList({
+                strings: albumsData.map((a) => `${a.albumName} (${a.assetCount} photos)`),
             });
-        }
 
-        this._redraw();
-    }
+            let currentAlbumId = settings.get_string('photos-album-id');
+            let idx = albumsData.findIndex((a) => a.id === currentAlbumId);
+            albumComboRow.selected = idx >= 0 ? idx : 0;
+            suppressAlbumSignal = false;
 
-    _subscribeToChanges() {
-        this._signalId = this._bus.signal_subscribe(
-            BLUEZ_SERVICE, PROPS_IFACE, 'PropertiesChanged', null, null,
-            Gio.DBusSignalFlags.NONE,
-            (connection, sender, path, iface, signal, params) => {
-                let [changedIface, changedProps] = params.deep_unpack();
-                if (changedIface !== DEVICE_IFACE && changedIface !== BATTERY_IFACE)
-                    return;
+            albumComboRow.visible = true;
 
-                let info = this._devices.get(path) || {
-                    name: path, icon: '', connected: false, percentage: undefined,
-                };
-
-                for (let key in changedProps) {
-                    let value = changedProps[key].deep_unpack();
-                    if (key === 'Connected') {
-                        info.connected = value;
-                        if (value)
-                            this._readBatteryOnce(path, info);
-                    } else if (key === 'Name' || key === 'Alias') {
-                        info.name = value;
-                    } else if (key === 'Icon') {
-                        info.icon = value;
-                    } else if (key === 'Percentage') {
-                        info.percentage = value;
-                    }
-                }
-
-                this._devices.set(path, info);
-                this._redraw();
+            // If nothing was previously selected, save the default selection.
+            if (idx < 0) {
+                let album = albumsData[0];
+                settings.set_string('photos-album-id', album.id);
+                settings.set_string('photos-album-name', album.albumName);
             }
-        );
-    }
-
-    _readBatteryOnce(path, info) {
-        try {
-            let result = this._bus.call_sync(
-                BLUEZ_SERVICE, path, PROPS_IFACE, 'Get',
-                new GLib.Variant('(ss)', [BATTERY_IFACE, 'Percentage']),
-                GLib.VariantType.new('(v)'),
-                Gio.DBusCallFlags.NONE, -1, null
-            );
-            info.percentage = result.deep_unpack()[0].deep_unpack();
-            this._devices.set(path, info);
-            this._redraw();
-        } catch (e) {
-        }
-    }
-}
-
-const CLOCK_SIZE = 90;
-
-class ClockWidget {
-    constructor(extension) {
-        this._extension = extension;
-        this._settings = extension.getSettings(SETTINGS_SCHEMA);
-        this._tickTimeoutId = null;
-    }
-
-    build() {
-        this._card = new St.BoxLayout({
-            vertical: true,
-            reactive: true,
-            style: `
-                background-color: rgba(28, 28, 30, 0.55);
-                border-radius: 20px;
-                border: 1px solid rgba(255,255,255,0.08);
-                padding: 14px;
-                min-width: 260px;
-            `,
-        });
-
-        try {
-            this._card.add_effect(new Shell.BlurEffect({
-                brightness: 0.65,
-                sigma: 40,
-                mode: Shell.BlurMode.BACKGROUND,
-            }));
-        } catch (e) {
-            logError(e, 'Clock widget: blur effect unavailable, using plain translucency');
-        }
-
-        this._card.add_child(new St.Label({
-            text: 'Clock',
-            style: `
-                font-weight: 700;
-                font-size: 15px;
-                color: rgba(255,255,255,0.92);
-                padding-bottom: 8px;
-                padding-left: 4px;
-            `,
-        }));
-
-        let wrap = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER, style: 'padding: 4px 0 6px 0;' });
-
-        this._face = new St.DrawingArea({ width: CLOCK_SIZE, height: CLOCK_SIZE });
-        this._face.connect('repaint', (area) => this._paintFace(area));
-        wrap.add_child(this._face);
-        this._card.add_child(wrap);
-
-        this._dateLabel = new St.Label({
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.6); font-size: 12px;',
-        });
-
-        let dateWrap = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER });
-        dateWrap.add_child(this._dateLabel);
-        this._card.add_child(dateWrap);
-
-        this._updateDateLabel();
-        this._scheduleTick();
-
-        return this._card;
-    }
-
-    refresh() {
-        this._updateDateLabel();
-        if (this._face)
-            this._face.queue_repaint();
-    }
-
-    destroy() {
-        if (this._tickTimeoutId !== null) {
-            GLib.source_remove(this._tickTimeoutId);
-            this._tickTimeoutId = null;
-        }
-        this._card = null;
-        this._face = null;
-        this._dateLabel = null;
-    }
-
-    _scheduleTick() {
-        // Repaint once a second — cheap for a small cairo face, and keeps
-        // the second hand smooth without any external dependency.
-        this._tickTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
-            if (this._face)
-                this._face.queue_repaint();
-            this._updateDateLabel();
-            return GLib.SOURCE_CONTINUE;
         });
     }
 
-    _updateDateLabel() {
-        if (!this._dateLabel)
-            return;
-        let now = GLib.DateTime.new_now_local();
-        this._dateLabel.text = now.format('%a, %b %-d');
-    }
-
-    _paintFace(area) {
-        let cr = area.get_context();
-        let [w, h] = area.get_surface_size();
-        let cx = w / 2;
-        let cy = h / 2;
-        let radius = Math.min(w, h) / 2 - 3;
-
-        // Face
-        cr.setSourceRGBA(1, 1, 1, 0.06);
-        cr.arc(cx, cy, radius, 0, 2 * Math.PI);
-        cr.fill();
-
-        cr.setSourceRGBA(1, 1, 1, 0.18);
-        cr.setLineWidth(1.5);
-        cr.arc(cx, cy, radius, 0, 2 * Math.PI);
-        cr.stroke();
-
-        // Hour ticks
-        for (let i = 0; i < 12; i++) {
-            let angle = (i / 12) * 2 * Math.PI;
-            let outer = radius - 2;
-            let inner = radius - (i % 3 === 0 ? 9 : 5);
-            cr.setSourceRGBA(1, 1, 1, i % 3 === 0 ? 0.55 : 0.3);
-            cr.setLineWidth(i % 3 === 0 ? 2 : 1.2);
-            cr.moveTo(cx + Math.sin(angle) * inner, cy - Math.cos(angle) * inner);
-            cr.lineTo(cx + Math.sin(angle) * outer, cy - Math.cos(angle) * outer);
-            cr.stroke();
-        }
-
-        let now = GLib.DateTime.new_now_local();
-        let hours = now.get_hour() % 12;
-        let minutes = now.get_minute();
-        let seconds = now.get_second();
-
-        let hourAngle = ((hours + minutes / 60) / 12) * 2 * Math.PI;
-        let minuteAngle = ((minutes + seconds / 60) / 60) * 2 * Math.PI;
-        let secondAngle = (seconds / 60) * 2 * Math.PI;
-
-        this._drawHand(cr, cx, cy, hourAngle, radius * 0.5, 3, [1, 1, 1, 0.92]);
-        this._drawHand(cr, cx, cy, minuteAngle, radius * 0.72, 2.2, [1, 1, 1, 0.92]);
-        this._drawHand(cr, cx, cy, secondAngle, radius * 0.8, 1, [0.98, 0.6, 0.25, 0.95]);
-
-        cr.setSourceRGBA(0.98, 0.6, 0.25, 0.95);
-        cr.arc(cx, cy, 2.4, 0, 2 * Math.PI);
-        cr.fill();
-
-        cr.$dispose();
-    }
-
-    _drawHand(cr, cx, cy, angle, length, width, rgba) {
-        cr.setSourceRGBA(rgba[0], rgba[1], rgba[2], rgba[3]);
-        cr.setLineWidth(width);
-        cr.setLineCap(1);
-        cr.moveTo(cx, cy);
-        cr.lineTo(cx + Math.sin(angle) * length, cy - Math.cos(angle) * length);
-        cr.stroke();
-    }
-}
-
-const STORAGE_RING_SIZE = 68;
-const STORAGE_RING_LINE_WIDTH = 5;
-
-function formatBytes(bytes) {
-    if (!Number.isFinite(bytes))
-        return '—';
-    let units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let value = bytes;
-    let unitIndex = 0;
-    while (value >= 1024 && unitIndex < units.length - 1) {
-        value /= 1024;
-        unitIndex++;
-    }
-    let decimals = value >= 100 || unitIndex === 0 ? 0 : 1;
-    return `${value.toFixed(decimals)} ${units[unitIndex]}`;
-}
-
-class StorageWidget {
-    constructor(extension) {
-        this._extension = extension;
-        this._settings = extension.getSettings(SETTINGS_SCHEMA);
-        this._settingsChangedId = null;
-        this._refreshTimeoutId = null;
-    }
-
-    build() {
-        this._card = new St.BoxLayout({
-            vertical: true,
-            reactive: true,
-            style: `
-                background-color: rgba(28, 28, 30, 0.55);
-                border-radius: 20px;
-                border: 1px solid rgba(255,255,255,0.08);
-                padding: 14px;
-                min-width: 260px;
-            `,
-        });
-
-        try {
-            this._card.add_effect(new Shell.BlurEffect({
-                brightness: 0.65,
-                sigma: 40,
-                mode: Shell.BlurMode.BACKGROUND,
-            }));
-        } catch (e) {
-            logError(e, 'Storage widget: blur effect unavailable, using plain translucency');
-        }
-
-        this._card.add_child(new St.Label({
-            text: 'Storage',
-            style: `
-                font-weight: 700;
-                font-size: 15px;
-                color: rgba(255,255,255,0.92);
-                padding-bottom: 8px;
-                padding-left: 4px;
-            `,
-        }));
-
-        this._contentBox = new St.Widget({ layout_manager: new Clutter.BinLayout() });
-        this._card.add_child(this._contentBox);
-
-        this._statusLabel = new St.Label({
-            text: 'Loading…',
-            style: 'color: rgba(255,255,255,0.5); font-size: 13px; padding: 6px 4px;',
-        });
-        this._card.add_child(this._statusLabel);
-
-        this._settingsChangedId = this._settings.connect(
-            'changed::storage-mount-path',
-            () => this.refresh()
-        );
-
-        this.refresh();
-        this._refreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 60, () => {
-            this.refresh();
-            return GLib.SOURCE_CONTINUE;
-        });
-
-        return this._card;
-    }
-
-    refresh() {
-        try {
-            this._refreshFromDisk();
-        } catch (e) {
-            logError(e, 'Storage widget: refresh failed');
-            this._showStatus('Unable to read filesystem info');
-        }
-    }
-
-    destroy() {
-        if (this._settingsChangedId !== null) {
-            this._settings.disconnect(this._settingsChangedId);
-            this._settingsChangedId = null;
-        }
-        if (this._refreshTimeoutId !== null) {
-            GLib.source_remove(this._refreshTimeoutId);
-            this._refreshTimeoutId = null;
-        }
-        this._card = null;
-        this._contentBox = null;
-        this._statusLabel = null;
-    }
-
-    _showStatus(text) {
-        if (!this._statusLabel)
-            return;
-        this._contentBox.hide();
-        this._statusLabel.text = text;
-        this._statusLabel.show();
-    }
-
-    _refreshFromDisk() {
-        let path = this._settings.get_string('storage-mount-path') || '/';
-        let file = Gio.File.new_for_path(path);
-
-        let info = file.query_filesystem_info(
-            'filesystem::size,filesystem::free',
-            null
-        );
-
-        let total = info.get_attribute_uint64('filesystem::size');
-        let free = info.get_attribute_uint64('filesystem::free');
-        let used = total - free;
-        let usedFraction = total > 0 ? used / total : 0;
-
-        this._renderStorage({ path, total, free, used, usedFraction });
-    }
-
-    _renderStorage(data) {
-        if (!this._contentBox)
-            return;
-
-        this._statusLabel.hide();
-        this._contentBox.show();
-        this._contentBox.destroy_all_children();
-
-        let cell = new St.BoxLayout({
-            vertical: true,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'spacing: 6px; padding: 4px 10px;',
-        });
-
-        let ringContainer = new St.Widget({
-            layout_manager: new Clutter.BinLayout(),
-            width: STORAGE_RING_SIZE,
-            height: STORAGE_RING_SIZE,
-        });
-
-        let area = new St.DrawingArea({ width: STORAGE_RING_SIZE, height: STORAGE_RING_SIZE });
-        area.connect('repaint', (a) => {
-            let cr = a.get_context();
-            let [w, h] = a.get_surface_size();
-            let cx = w / 2;
-            let cy = h / 2;
-            let radius = Math.min(w, h) / 2 - STORAGE_RING_LINE_WIDTH / 2 - 1;
-
-            cr.setSourceRGBA(1, 1, 1, 0.15);
-            cr.setLineWidth(STORAGE_RING_LINE_WIDTH);
-            cr.arc(cx, cy, radius, 0, 2 * Math.PI);
-            cr.stroke();
-
-            let fraction = Math.max(0, Math.min(1, data.usedFraction));
-            let startAngle = -Math.PI / 2;
-            let endAngle = startAngle + fraction * 2 * Math.PI;
-
-            if (fraction < 0.7)
-                cr.setSourceRGBA(0.20, 0.84, 0.29, 1);
-            else if (fraction < 0.9)
-                cr.setSourceRGBA(0.95, 0.70, 0.15, 1);
-            else
-                cr.setSourceRGBA(0.92, 0.26, 0.21, 1);
-
-            cr.setLineWidth(STORAGE_RING_LINE_WIDTH);
-            cr.setLineCap(0);
-            cr.arc(cx, cy, radius, startAngle, endAngle);
-            cr.stroke();
-
-            cr.$dispose();
-        });
-
-        let icon = new St.Icon({
-            icon_name: 'drive-harddisk-symbolic',
-            icon_size: 22,
-            x_align: Clutter.ActorAlign.CENTER,
-            y_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.92);',
-        });
-
-        ringContainer.add_child(area);
-        ringContainer.add_child(icon);
-        cell.add_child(ringContainer);
-
-        cell.add_child(new St.Label({
-            text: `${Math.round(data.usedFraction * 100)}% used`,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.92); font-size: 15px; font-weight: 500;',
-        }));
-
-        cell.add_child(new St.Label({
-            text: `${formatBytes(data.free)} free of ${formatBytes(data.total)}`,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.6); font-size: 12px;',
-        }));
-
-        cell.add_child(new St.Label({
-            text: data.path,
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.45); font-size: 11px; padding-top: 2px;',
-        }));
-
-        this._contentBox.add_child(cell);
-    }
-}
-
-const PHOTOS_SLIDE_INTERVAL_SECONDS = 20;
-
-class PhotosWidget {
-    constructor(extension) {
-        this._extension = extension;
-        this._settings = extension.getSettings(SETTINGS_SCHEMA);
-        this._settingsChangedIds = [];
-        this._slideTimeoutId = null;
-        this._apiKey = null;
-        this._instanceUrl = null;
-        this._assetIds = [];
-        this._assetIndex = 0;
-        this._destroyed = false;
-        this._loadToken = 0;
-    }
-
-    build() {
-        this._card = new St.BoxLayout({
-            vertical: true,
-            reactive: true,
-            style: `
-                background-color: rgba(28, 28, 30, 0.55);
-                border-radius: 20px;
-                border: 1px solid rgba(255,255,255,0.08);
-                padding: 14px;
-                min-width: 260px;
-            `,
-        });
-
-        try {
-            this._card.add_effect(new Shell.BlurEffect({
-                brightness: 0.65,
-                sigma: 40,
-                mode: Shell.BlurMode.BACKGROUND,
-            }));
-        } catch (e) {
-            logError(e, 'Photos widget: blur effect unavailable, using plain translucency');
-        }
-
-        this._card.add_child(new St.Label({
-            text: 'Photos',
-            style: `
-                font-weight: 700;
-                font-size: 15px;
-                color: rgba(255,255,255,0.92);
-                padding-bottom: 8px;
-                padding-left: 4px;
-            `,
-        }));
-
-        this._imageBin = new St.Widget({
-            layout_manager: new Clutter.BinLayout(),
-            width: 248,
-            height: 172,
-            style: 'border-radius: 12px; background-color: rgba(0,0,0,0.2); background-size: cover; background-position: center;',
-            clip_to_allocation: true,
-        });
-
-        let imageWrap = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER });
-        imageWrap.add_child(this._imageBin);
-        this._card.add_child(imageWrap);
-
-        this._captionLabel = new St.Label({
-            x_align: Clutter.ActorAlign.CENTER,
-            style: 'color: rgba(255,255,255,0.6); font-size: 12px; padding-top: 8px;',
-        });
-        let captionWrap = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER });
-        captionWrap.add_child(this._captionLabel);
-        this._card.add_child(captionWrap);
-
-        this._statusLabel = new St.Label({
-            text: 'Loading…',
-            style: 'color: rgba(255,255,255,0.5); font-size: 13px; padding: 6px 4px;',
-        });
-        this._card.add_child(this._statusLabel);
-
-        for (let key of ['photos-album-id', 'photos-instance-url']) {
-            this._settingsChangedIds.push(
-                this._settings.connect(`changed::${key}`, () => this.refresh())
-            );
-        }
-
-        this.refresh();
-
-        return this._card;
-    }
-
-    refresh() {
-        this._loadAlbum().catch((e) => {
-            if (this._destroyed)
-                return;
-            logError(e, 'Photos widget: failed to load album');
-            this._showStatus('Unable to reach Immich server');
-        });
-    }
-
-    destroy() {
-        this._destroyed = true;
-
-        for (let id of this._settingsChangedIds)
-            this._settings.disconnect(id);
-        this._settingsChangedIds = [];
-
-        if (this._slideTimeoutId !== null) {
-            GLib.source_remove(this._slideTimeoutId);
-            this._slideTimeoutId = null;
-        }
-
-        this._card = null;
-        this._imageBin = null;
-        this._captionLabel = null;
-        this._statusLabel = null;
-    }
-
-    async _loadAlbum() {
-        let token = ++this._loadToken;
-
-        let url = this._settings.get_string('photos-instance-url').trim().replace(/\/+$/, '');
-        let albumId = this._settings.get_string('photos-album-id');
-
-        if (!url || !albumId) {
-            this._showStatus('No album selected — pick one in extension preferences');
+    testButton.connect('clicked', () => {
+        let url = urlRow.get_text().trim().replace(/\/+$/, '');
+        let apiKey = keyRow.get_text().trim();
+
+        if (!url || !apiKey) {
+            statusRow.subtitle = 'Please enter both a server URL and an API key';
             return;
         }
 
-        let apiKey = await lookupApiKey(url);
-        if (token !== this._loadToken || this._destroyed)
-            return;
+        testButton.sensitive = false;
+        statusRow.subtitle = 'Testing…';
 
-        if (!apiKey) {
-            this._showStatus('No API key found — reconnect in extension preferences');
-            return;
-        }
+        testImmichConnection(url, apiKey, (ok, userOrError) => {
+            testButton.sensitive = true;
 
-        this._instanceUrl = url;
-        this._apiKey = apiKey;
-
-        let album = await fetchJsonAuth(`${url}/api/albums/${albumId}`, apiKey);
-        if (token !== this._loadToken || this._destroyed)
-            return;
-
-        this._assetIds = (album.assets || []).map((a) => a.id);
-        this._assetIndex = 0;
-
-        if (this._captionLabel)
-            this._captionLabel.text = album.albumName || '';
-
-        if (this._assetIds.length === 0) {
-            this._showStatus('This album has no photos');
-            return;
-        }
-
-        this._showNextPhoto();
-        this._scheduleSlideshow();
-    }
-
-    _scheduleSlideshow() {
-        if (this._slideTimeoutId !== null) {
-            GLib.source_remove(this._slideTimeoutId);
-            this._slideTimeoutId = null;
-        }
-        this._slideTimeoutId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT, PHOTOS_SLIDE_INTERVAL_SECONDS,
-            () => {
-                this._showNextPhoto();
-                return GLib.SOURCE_CONTINUE;
-            }
-        );
-    }
-
-    _showNextPhoto() {
-        if (this._assetIds.length === 0)
-            return;
-
-        let assetId = this._assetIds[this._assetIndex];
-        this._assetIndex = (this._assetIndex + 1) % this._assetIds.length;
-
-        let url = `${this._instanceUrl}/api/assets/${assetId}/thumbnail?size=preview`;
-        fetchBytesAuth(url, this._apiKey).then((bytes) => {
-            if (this._destroyed || !this._imageBin)
-                return;
-
-            let path = this._cacheFileForAsset(assetId);
-            try {
-                let file = Gio.File.new_for_path(path);
-                file.replace_contents(
-                    bytes.get_data(), null, false,
-                    Gio.FileCreateFlags.REPLACE_DESTINATION, null
-                );
-            } catch (e) {
-                logError(e, 'Photos widget: failed to cache thumbnail to disk');
+            if (!ok) {
+                statusRow.subtitle = `Connection failed: ${userOrError}`;
+                albumComboRow.visible = false;
                 return;
             }
 
-            this._statusLabel.hide();
-            this._imageBin.show();
-            this._imageBin.style = `
-                border-radius: 12px;
-                background-size: cover;
-                background-position: center;
-                background-image: url("file://${path}");
-            `;
-        }).catch((e) => {
-            logError(e, 'Photos widget: failed to load thumbnail');
+            settings.set_string('photos-instance-url', url);
+            storeApiKey(url, apiKey, settings).catch((e) =>
+                logError(e, 'Desktop Widgets prefs: failed to save Immich API key'));
+            statusRow.subtitle = `Connected as ${userOrError}`;
+
+            populateAlbums(url, apiKey);
+        });
+    });
+
+    albumComboRow.connect('notify::selected', () => {
+        if (suppressAlbumSignal)
+            return;
+        let album = albumsData[albumComboRow.selected];
+        if (!album)
+            return;
+        settings.set_string('photos-album-id', album.id);
+        settings.set_string('photos-album-name', album.albumName);
+    });
+
+    // If we already have a saved URL + key, try to populate albums right away.
+    if (existingUrl) {
+        lookupApiKey(existingUrl, settings).then((key) => {
+            if (key)
+                populateAlbums(existingUrl, key);
         });
     }
 
-    _cacheFileForAsset(assetId) {
-        let dir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'bluetooth-desktop-widget', 'photos']);
-        GLib.mkdir_with_parents(dir, 0o700);
-        // Reuse one file per position in the rotation (rather than per asset)
-        // so the on-disk cache doesn't grow unboundedly for large albums.
-        let slot = this._assetIndex % 6;
-        return GLib.build_filenamev([dir, `thumb-${slot}-${assetId}.jpg`]);
-    }
+    let hint = new Adw.ActionRow({
+        subtitle: 'Generate an API key in Immich under Account Settings → API Keys. The key is stored in your system keyring, not in plain settings.',
+    });
+    group.add(hint);
 
-    _showStatus(text) {
-        if (!this._statusLabel)
-            return;
-        this._imageBin.hide();
-        this._statusLabel.text = text;
-        this._statusLabel.show();
-    }
+    return group;
 }
 
-const WIDGET_DEFS = {
-    bluetooth: {
-        name: 'Bluetooth',
-        icon: 'bluetooth-active-symbolic',
-        create: (extension) => new BluetoothWidget(extension),
-    },
-    weather: {
-        name: 'Weather',
-        icon: 'weather-few-clouds-symbolic',
-        create: (extension) => new WeatherWidget(extension),
-    },
-    clock: {
-        name: 'Analog Clock',
-        icon: 'preferences-system-time-symbolic',
-        create: (extension) => new ClockWidget(extension),
-    },
-    storage: {
-        name: 'Storage',
-        icon: 'drive-harddisk-symbolic',
-        create: (extension) => new StorageWidget(extension),
-    },
-    photos: {
-        name: 'Photos',
-        icon: 'image-x-generic-symbolic',
-        create: (extension) => new PhotosWidget(extension),
-    },
-};
+function buildStorageSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Storage',
+        description: 'Configure the Storage widget',
+    });
 
-const LAYOUT_SETTINGS_KEYS = [
-    'container-anchor',
-    'container-margin-x',
-    'container-margin-y',
-    'widget-spacing',
-    'column-spacing',
-];
+    let row = new Adw.EntryRow({
+        title: 'Mount path',
+    });
+    row.set_text(settings.get_string('storage-mount-path') || '/');
 
-export default class DesktopWidgetsExtension extends Extension {
-    enable() {
-        this._settings = this.getSettings(SETTINGS_SCHEMA);
-        this._activeWidgets = []; // [{ id, instance }]
+    row.connect('changed', () => {
+        let text = row.get_text().trim();
+        settings.set_string('storage-mount-path', text || '/');
+    });
 
-        // this._columnsBox holds one or more vertical columns; a column
-        // overflows into a new one once its stacked widgets would run past
-        // the bottom of the usable screen area.
-        this._columnsBox = new St.BoxLayout({ vertical: false });
-        Main.layoutManager._backgroundGroup.add_child(this._columnsBox);
+    group.add(row);
 
-        this._configChangedId = this._settings.connect(
-            `changed::${SETTINGS_KEY_WIDGETS_CONFIG}`,
-            () => this._rebuildWidgets()
-        );
+    let hint = new Adw.ActionRow({
+        subtitle: 'Filesystem path to report usage for, e.g. "/" or "/home".',
+    });
+    group.add(hint);
 
-        this._layoutChangedIds = LAYOUT_SETTINGS_KEYS.map((key) =>
-            this._settings.connect(`changed::${key}`, () => this._rebuildWidgets())
-        );
+    return group;
+}
 
-        this._monitorsChangedId = Main.layoutManager.connect(
-            'monitors-changed',
-            () => this._rebuildWidgets()
-        );
+function buildLayoutSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Position & Spacing',
+        description: 'Where the widget stack sits on the desktop, and how it overflows into extra columns when it runs out of vertical room',
+    });
 
-        this._rebuildWidgets();
+    let anchorRow = new Adw.ComboRow({
+        title: 'Screen corner',
+        subtitle: 'Which corner the widgets anchor to',
+        model: new Gtk.StringList({ strings: ['Top left', 'Top right', 'Bottom left', 'Bottom right'] }),
+    });
+    const ANCHOR_VALUES = ['top-left', 'top-right', 'bottom-left', 'bottom-right'];
+    let currentAnchor = settings.get_string('container-anchor');
+    let anchorIdx = ANCHOR_VALUES.indexOf(currentAnchor);
+    anchorRow.selected = anchorIdx >= 0 ? anchorIdx : 1;
+    anchorRow.connect('notify::selected', () => {
+        settings.set_string('container-anchor', ANCHOR_VALUES[anchorRow.selected]);
+    });
+    group.add(anchorRow);
+
+    function spinRow(title, subtitle, key, lower, upper, step) {
+        let row = new Adw.SpinRow({
+            title,
+            subtitle,
+            adjustment: new Gtk.Adjustment({
+                lower, upper,
+                step_increment: step,
+                value: settings.get_int(key),
+            }),
+        });
+        row.connect('notify::value', () => {
+            settings.set_int(key, row.value);
+        });
+        group.add(row);
+        return row;
     }
 
-    disable() {
-        if (this._configChangedId !== null) {
-            this._settings.disconnect(this._configChangedId);
-            this._configChangedId = null;
-        }
+    spinRow('Horizontal margin', 'Distance from the left/right screen edge, in pixels',
+        'container-margin-x', 0, 400, 5);
+    spinRow('Vertical margin', 'Distance from the top/bottom screen edge, in pixels',
+        'container-margin-y', 0, 400, 5);
+    spinRow('Widget spacing', 'Gap between stacked widgets within a column, in pixels',
+        'widget-spacing', 0, 60, 2);
+    spinRow('Column spacing', 'Gap between columns once widgets overflow into a new one, in pixels',
+        'column-spacing', 0, 80, 2);
 
-        for (let id of this._layoutChangedIds || [])
-            this._settings.disconnect(id);
-        this._layoutChangedIds = [];
+    let hint = new Adw.ActionRow({
+        subtitle: 'If the stack of enabled widgets is taller than the screen, it automatically continues in a new column next to the first.',
+    });
+    group.add(hint);
 
-        if (this._monitorsChangedId !== null) {
-            Main.layoutManager.disconnect(this._monitorsChangedId);
-            this._monitorsChangedId = null;
-        }
+    return group;
+}
 
-        this._destroyWidgets();
-        destroyHttpSession();
+export default class DesktopWidgetsPreferences extends ExtensionPreferences {
+    fillPreferencesWindow(window) {
+        let settings = this.getSettings(SETTINGS_SCHEMA);
 
-        if (this._columnsBox) {
-            Main.layoutManager._backgroundGroup.remove_child(this._columnsBox);
-            this._columnsBox.destroy();
-            this._columnsBox = null;
-        }
+        let page = new Adw.PreferencesPage({
+            title: 'General',
+            icon_name: 'preferences-desktop-symbolic',
+        });
 
-        this._settings = null;
-    }
-
-    _destroyWidgets() {
-        for (let { instance } of this._activeWidgets) {
+        let addGroupSafely = (label, buildFn) => {
             try {
-                instance.destroy();
+                page.add(buildFn());
             } catch (e) {
-                logError(e, 'Desktop Widgets: error destroying widget');
+                logError(e, `Desktop Widgets prefs: failed to build "${label}" settings group`);
+                let errorGroup = new Adw.PreferencesGroup({ title: label });
+                errorGroup.add(new Adw.ActionRow({
+                    title: 'This section failed to load',
+                    subtitle: e.message || String(e),
+                }));
+                page.add(errorGroup);
             }
-        }
-        this._activeWidgets = [];
-        if (this._columnsBox)
-            this._columnsBox.destroy_all_children();
-    }
+        };
 
-    _rebuildWidgets() {
-        this._destroyWidgets();
+        addGroupSafely('Widgets', () => buildWidgetsListGroup(settings, window));
 
-        let widgetSpacing = this._settings.get_int('widget-spacing');
-        let columnSpacing = this._settings.get_int('column-spacing');
-        let marginX = this._settings.get_int('container-margin-x');
-        let marginY = this._settings.get_int('container-margin-y');
-        let anchor = this._settings.get_string('container-anchor');
-
-        let monitor = Main.layoutManager.primaryMonitor;
-        let maxColumnHeight = Math.max(100, monitor.height - marginY * 2);
-
-        this._columnsBox.set_style(`spacing: ${columnSpacing}px;`);
-
-        let config = loadWidgetsConfig(this._settings);
-        let currentColumn = null;
-        let currentColumnHeight = 0;
-
-        for (let entry of config) {
-            if (!entry.enabled)
-                continue;
-
-            let def = WIDGET_DEFS[entry.id];
-            if (!def) {
-                log(`Desktop Widgets: unknown widget id "${entry.id}" in config, skipping`);
-                continue;
-            }
-
-            let instance = def.create(this);
-            let actor;
-            try {
-                actor = instance.build();
-            } catch (e) {
-                logError(e, `Desktop Widgets: failed to build widget "${entry.id}"`);
-                continue;
-            }
-
-            let [, naturalHeight] = actor.get_preferred_height(-1);
-            let addedHeight = naturalHeight + (currentColumn && currentColumn.get_n_children() > 0 ? widgetSpacing : 0);
-
-            if (!currentColumn || currentColumnHeight + addedHeight > maxColumnHeight) {
-                currentColumn = new St.BoxLayout({
-                    vertical: true,
-                    style: `spacing: ${widgetSpacing}px;`,
-                });
-                this._columnsBox.add_child(currentColumn);
-                currentColumnHeight = 0;
-                addedHeight = naturalHeight;
-            }
-
-            currentColumn.add_child(actor);
-            currentColumnHeight += addedHeight;
-            this._activeWidgets.push({ id: entry.id, instance });
+        for (let meta of WIDGET_CATALOG) {
+            if (meta.implemented && meta.buildSettings)
+                addGroupSafely(meta.name, () => meta.buildSettings(settings));
         }
 
-        this._positionColumns(monitor, anchor, marginX, marginY);
-    }
+        addGroupSafely('Position & Spacing', () => buildLayoutSettingsGroup(settings));
 
-    _positionColumns(monitor, anchor, marginX, marginY) {
-        let [, , naturalWidth, naturalHeight] = this._columnsBox.get_preferred_size();
-
-        let x = anchor.endsWith('right')
-            ? monitor.width - marginX - naturalWidth
-            : marginX;
-        let y = anchor.startsWith('bottom')
-            ? monitor.height - marginY - naturalHeight
-            : marginY;
-
-        this._columnsBox.set_position(monitor.x + x, monitor.y + y);
+        window.add(page);
+        window.set_default_size(480, 680);
     }
 }

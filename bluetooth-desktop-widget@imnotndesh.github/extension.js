@@ -4,7 +4,6 @@ import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Shell from 'gi://Shell';
 import Soup from 'gi://Soup?version=3.0';
-import Secret from 'gi://Secret';
 
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -76,20 +75,50 @@ function fetchJson(url) {
     });
 }
 
-const PHOTOS_SECRET_SCHEMA = new Secret.Schema(
-    'org.gnome.shell.extensions.bluetooth-desktop-widget.photos',
-    Secret.SchemaFlags.NONE,
-    { 'instance-url': Secret.SchemaAttributeType.STRING }
-);
+// See prefs.js for why libsecret is loaded lazily rather than imported at
+// module scope: a missing typelib there must not stop the whole extension
+// (or the whole prefs window) from loading.
+let _secretModulePromise = null;
+function getSecretModule() {
+    if (!_secretModulePromise) {
+        _secretModulePromise = import('gi://Secret')
+            .then((m) => m.default)
+            .catch((e) => {
+                logError(e, 'Desktop Widgets: libsecret unavailable, falling back to GSettings storage for the Immich API key');
+                return null;
+            });
+    }
+    return _secretModulePromise;
+}
 
-function lookupApiKey(instanceUrl) {
+let _photosSecretSchema = null;
+async function getPhotosSecretSchema() {
+    let Secret = await getSecretModule();
+    if (!Secret)
+        return null;
+    if (!_photosSecretSchema) {
+        _photosSecretSchema = new Secret.Schema(
+            'org.gnome.shell.extensions.bluetooth-desktop-widget.photos',
+            Secret.SchemaFlags.NONE,
+            { 'instance-url': Secret.SchemaAttributeType.STRING }
+        );
+    }
+    return _photosSecretSchema;
+}
+
+async function lookupApiKey(instanceUrl, settings) {
+    if (!instanceUrl)
+        return settings.get_string('photos-api-key-plain') || null;
+
+    let Secret = await getSecretModule();
+    let schema = await getPhotosSecretSchema();
+
+    if (!Secret || !schema)
+        return settings.get_string('photos-api-key-plain') || null;
+
     return new Promise((resolve) => {
-        if (!instanceUrl) {
-            resolve(null);
-            return;
-        }
         Secret.password_lookup(
-            PHOTOS_SECRET_SCHEMA,
+            schema,
             { 'instance-url': instanceUrl },
             null,
             (source, result) => {
@@ -99,7 +128,7 @@ function lookupApiKey(instanceUrl) {
                 } catch (e) {
                     logError(e, 'Desktop Widgets: failed to look up Immich API key');
                 }
-                resolve(apiKey);
+                resolve(apiKey || settings.get_string('photos-api-key-plain') || null);
             }
         );
     });
@@ -1246,7 +1275,7 @@ class PhotosWidget {
             return;
         }
 
-        let apiKey = await lookupApiKey(url);
+        let apiKey = await lookupApiKey(url, this._settings);
         if (token !== this._loadToken || this._destroyed)
             return;
 
