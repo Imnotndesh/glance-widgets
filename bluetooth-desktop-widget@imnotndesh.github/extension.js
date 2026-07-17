@@ -1150,7 +1150,7 @@ class StorageWidget {
     }
 }
 
-const PHOTOS_SLIDE_INTERVAL_SECONDS = 20;
+const PHOTOS_FADE_DURATION_MS = 280;
 
 class PhotosWidget {
     constructor(extension) {
@@ -1231,6 +1231,12 @@ class PhotosWidget {
                 this._settings.connect(`changed::${key}`, () => this.refresh())
             );
         }
+        this._settingsChangedIds.push(
+            this._settings.connect('changed::photos-slide-interval-seconds', () => {
+                if (this._assetIds.length > 0)
+                    this._scheduleSlideshow();
+            })
+        );
 
         this.refresh();
 
@@ -1311,8 +1317,9 @@ class PhotosWidget {
             GLib.source_remove(this._slideTimeoutId);
             this._slideTimeoutId = null;
         }
+        let intervalSeconds = this._settings.get_int('photos-slide-interval-seconds') || 20;
         this._slideTimeoutId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT, PHOTOS_SLIDE_INTERVAL_SECONDS,
+            GLib.PRIORITY_DEFAULT, intervalSeconds,
             () => {
                 this._showNextPhoto();
                 return GLib.SOURCE_CONTINUE;
@@ -1344,16 +1351,57 @@ class PhotosWidget {
                 return;
             }
 
-            this._statusLabel.hide();
-            this._imageBin.show();
+            this._applyPhoto(path);
+        }).catch((e) => {
+            logError(e, 'Photos widget: failed to load thumbnail');
+        });
+    }
+
+    _applyPhoto(path) {
+        if (!this._imageBin)
+            return;
+
+        let isFirstPhoto = this._statusLabel.visible;
+        this._statusLabel.hide();
+        this._imageBin.show();
+
+        let setImage = () => {
+            if (!this._imageBin)
+                return;
             this._imageBin.style = `
                 border-radius: 12px;
                 background-size: cover;
                 background-position: center;
                 background-image: url("file://${path}");
             `;
-        }).catch((e) => {
-            logError(e, 'Photos widget: failed to load thumbnail');
+        };
+
+        if (isFirstPhoto) {
+            // Nothing to crossfade from yet — just show it.
+            this._imageBin.opacity = 0;
+            setImage();
+            this._imageBin.ease({
+                opacity: 255,
+                duration: PHOTOS_FADE_DURATION_MS,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+            return;
+        }
+
+        this._imageBin.ease({
+            opacity: 0,
+            duration: PHOTOS_FADE_DURATION_MS,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => {
+                if (!this._imageBin)
+                    return;
+                setImage();
+                this._imageBin.ease({
+                    opacity: 255,
+                    duration: PHOTOS_FADE_DURATION_MS,
+                    mode: Clutter.AnimationMode.EASE_IN_QUAD,
+                });
+            },
         });
     }
 
@@ -1489,13 +1537,15 @@ export default class DesktopWidgetsExtension extends Extension {
         let anchor = this._settings.get_string('container-anchor');
 
         let monitor = Main.layoutManager.primaryMonitor;
-        let maxColumnHeight = Math.max(100, monitor.height - marginY * 2);
 
         this._columnsBox.set_style(`spacing: ${columnSpacing}px;`);
 
         let config = loadWidgetsConfig(this._settings);
-        let currentColumn = null;
-        let currentColumnHeight = 0;
+
+        // Group enabled widgets by their explicit column assignment (set in
+        // preferences; 1 = the column nearest the anchored corner),
+        // preserving each widget's relative order within its column.
+        let columns = new Map(); // columnNumber -> [actor, ...]
 
         for (let entry of config) {
             if (!entry.enabled)
@@ -1516,22 +1566,45 @@ export default class DesktopWidgetsExtension extends Extension {
                 continue;
             }
 
-            let [, naturalHeight] = actor.get_preferred_height(-1);
-            let addedHeight = naturalHeight + (currentColumn && currentColumn.get_n_children() > 0 ? widgetSpacing : 0);
+            let columnNumber = Number.isInteger(entry.column) && entry.column >= 1 ? entry.column : 1;
+            if (!columns.has(columnNumber))
+                columns.set(columnNumber, []);
+            columns.get(columnNumber).push(actor);
 
-            if (!currentColumn || currentColumnHeight + addedHeight > maxColumnHeight) {
-                currentColumn = new St.BoxLayout({
-                    vertical: true,
-                    style: `spacing: ${widgetSpacing}px;`,
-                });
-                this._columnsBox.add_child(currentColumn);
-                currentColumnHeight = 0;
-                addedHeight = naturalHeight;
-            }
-
-            currentColumn.add_child(actor);
-            currentColumnHeight += addedHeight;
             this._activeWidgets.push({ id: entry.id, instance });
+        }
+
+        // Column 1 must end up visually nearest the anchored corner. Clutter/St
+        // lay out BoxLayout children in insertion order (first added = leftmost
+        // for a horizontal box, topmost for a vertical one). So:
+        //  - Anchored to the right: insert columns highest-number-first, so
+        //    column 1 is added last and lands rightmost (nearest the edge).
+        //  - Anchored to the left: insert ascending as normal (column 1 first
+        //    = leftmost = nearest the edge).
+        // The same logic applies vertically, within each column, for a
+        // bottom anchor: the first-listed widget should end up nearest the
+        // bottom edge, so the column's children are reversed before adding.
+        let horizontalReverse = anchor.endsWith('right');
+        let verticalReverse = anchor.startsWith('bottom');
+
+        let sortedColumnNumbers = [...columns.keys()].sort((a, b) => a - b);
+        if (horizontalReverse)
+            sortedColumnNumbers.reverse();
+
+        for (let columnNumber of sortedColumnNumbers) {
+            let columnBox = new St.BoxLayout({
+                vertical: true,
+                style: `spacing: ${widgetSpacing}px;`,
+            });
+
+            let actors = columns.get(columnNumber);
+            if (verticalReverse)
+                actors = [...actors].reverse();
+
+            for (let actor of actors)
+                columnBox.add_child(actor);
+
+            this._columnsBox.add_child(columnBox);
         }
 
         this._positionColumns(monitor, anchor, marginX, marginY);

@@ -64,7 +64,12 @@ function loadConfig(settings) {
 
     for (let entry of WIDGET_CATALOG) {
         if (!config.some((e) => e.id === entry.id))
-            config.push({ id: entry.id, enabled: false });
+            config.push({ id: entry.id, enabled: false, column: 1 });
+    }
+
+    for (let entry of config) {
+        if (typeof entry.column !== 'number' || entry.column < 1)
+            entry.column = 1;
     }
 
     return config;
@@ -75,9 +80,11 @@ function saveConfig(settings, config) {
 }
 
 function buildWidgetsListGroup(settings, window) {
+    const MAX_COLUMNS = 6;
+
     let group = new Adw.PreferencesGroup({
         title: 'Widgets',
-        description: 'Choose which widgets appear on the desktop and in what order',
+        description: 'Choose which widgets appear on the desktop, which column they sit in (column 1 sits nearest your chosen screen corner), and their stacking order within that column',
     });
 
     function render() {
@@ -103,11 +110,27 @@ function buildWidgetsListGroup(settings, window) {
                 valign: Gtk.Align.CENTER,
             });
 
+            let columnLabel = new Gtk.Label({ label: 'Col', valign: Gtk.Align.CENTER });
+            let columnSpin = new Gtk.SpinButton({
+                valign: Gtk.Align.CENTER,
+                sensitive: meta.implemented,
+                adjustment: new Gtk.Adjustment({
+                    lower: 1, upper: MAX_COLUMNS, step_increment: 1,
+                    value: entry.column || 1,
+                }),
+            });
+            columnSpin.connect('notify::value', () => {
+                let cfg = loadConfig(settings);
+                cfg[index].column = columnSpin.get_value_as_int();
+                saveConfig(settings, cfg);
+            });
+
             let upButton = new Gtk.Button({
                 icon_name: 'go-up-symbolic',
                 valign: Gtk.Align.CENTER,
                 sensitive: meta.implemented && index > 0,
                 css_classes: ['flat'],
+                tooltip_text: 'Move earlier in stacking order',
             });
             upButton.connect('clicked', () => {
                 let cfg = loadConfig(settings);
@@ -121,6 +144,7 @@ function buildWidgetsListGroup(settings, window) {
                 valign: Gtk.Align.CENTER,
                 sensitive: meta.implemented && index < config.length - 1,
                 css_classes: ['flat'],
+                tooltip_text: 'Move later in stacking order',
             });
             downButton.connect('clicked', () => {
                 let cfg = loadConfig(settings);
@@ -140,6 +164,8 @@ function buildWidgetsListGroup(settings, window) {
                 saveConfig(settings, cfg);
             });
 
+            controls.append(columnLabel);
+            controls.append(columnSpin);
             controls.append(upButton);
             controls.append(downButton);
             controls.append(toggle);
@@ -153,6 +179,12 @@ function buildWidgetsListGroup(settings, window) {
 
     group._rows = [];
     render();
+
+    let hint = new Adw.ActionRow({
+        subtitle: 'Widgets in the same column stack in the order above, starting from the anchored corner. Different column numbers place widgets side by side, with column 1 nearest the corner you pick below.',
+    });
+    group.add(hint);
+    group._rows.push(hint);
 
     return group;
 }
@@ -477,6 +509,19 @@ function buildPhotosSettingsGroup(settings) {
         });
     }
 
+    let intervalRow = new Adw.SpinRow({
+        title: 'Slideshow interval',
+        subtitle: 'Seconds between photo changes',
+        adjustment: new Gtk.Adjustment({
+            lower: 3, upper: 300, step_increment: 1,
+            value: settings.get_int('photos-slide-interval-seconds'),
+        }),
+    });
+    intervalRow.connect('notify::value', () => {
+        settings.set_int('photos-slide-interval-seconds', intervalRow.value);
+    });
+    group.add(intervalRow);
+
     let hint = new Adw.ActionRow({
         subtitle: 'Generate an API key in Immich under Account Settings → API Keys. The key is stored in your system keyring, not in plain settings.',
     });
@@ -514,7 +559,7 @@ function buildStorageSettingsGroup(settings) {
 function buildLayoutSettingsGroup(settings) {
     let group = new Adw.PreferencesGroup({
         title: 'Position & Spacing',
-        description: 'Where the widget stack sits on the desktop, and how it overflows into extra columns when it runs out of vertical room',
+        description: 'Where the widget grid sits on the desktop. Assign each widget to a column in the Widgets section above to arrange them side by side.',
     });
 
     let anchorRow = new Adw.ComboRow({
@@ -558,7 +603,7 @@ function buildLayoutSettingsGroup(settings) {
         'column-spacing', 0, 80, 2);
 
     let hint = new Adw.ActionRow({
-        subtitle: 'If the stack of enabled widgets is taller than the screen, it automatically continues in a new column next to the first.',
+        subtitle: 'Set each widget\'s column number in the Widgets list above. Column 1 always sits nearest the corner you pick here — e.g. with "Top right" selected, column 1 hugs the right edge and column 2 sits to its left; with "Top left" selected, column 1 hugs the left edge and column 2 sits to its right. The same applies vertically for stacking order within a column when anchored to the bottom.',
     });
     group.add(hint);
 
