@@ -134,6 +134,46 @@ async function lookupApiKey(instanceUrl, settings) {
     });
 }
 
+let _githubSecretSchema = null;
+async function getGithubSecretSchema() {
+    let Secret = await getSecretModule();
+    if (!Secret)
+        return null;
+    if (!_githubSecretSchema) {
+        _githubSecretSchema = new Secret.Schema(
+            'org.gnome.shell.extensions.glance-widgets.github',
+            Secret.SchemaFlags.NONE,
+            { 'account': Secret.SchemaAttributeType.STRING }
+        );
+    }
+    return _githubSecretSchema;
+}
+
+async function lookupGithubToken(settings) {
+    let Secret = await getSecretModule();
+    let schema = await getGithubSecretSchema();
+
+    if (!Secret || !schema)
+        return settings.get_string('github-token-plain') || null;
+
+    return new Promise((resolve) => {
+        Secret.password_lookup(
+            schema,
+            { 'account': 'github' },
+            null,
+            (source, result) => {
+                let token = null;
+                try {
+                    token = Secret.password_lookup_finish(result);
+                } catch (e) {
+                    logError(e, 'Glance Widgets: failed to look up GitHub token');
+                }
+                resolve(token || settings.get_string('github-token-plain') || null);
+            }
+        );
+    });
+}
+
 function fetchJsonAuth(url, apiKey) {
     return new Promise((resolve, reject) => {
         let message = Soup.Message.new('GET', url);
@@ -191,7 +231,102 @@ function fetchBytesAuth(url, apiKey) {
     });
 }
 
+function fetchGithubJson(url, token) {
+    return new Promise((resolve, reject) => {
+        let message = Soup.Message.new('GET', url);
+        if (!message) {
+            reject(new Error(`Invalid URL: ${url}`));
+            return;
+        }
+        message.request_headers.append('Authorization', `Bearer ${token}`);
+        message.request_headers.append('Accept', 'application/vnd.github+json');
+        message.request_headers.append('X-GitHub-Api-Version', '2022-11-28');
+
+        getHttpSession().send_and_read_async(
+            message, GLib.PRIORITY_DEFAULT, null,
+            (session, result) => {
+                try {
+                    let bytes = session.send_and_read_finish(result);
+                    let status = message.get_status();
+                    let text = new TextDecoder('utf-8').decode(bytes.get_data());
+                    if (status !== Soup.Status.OK) {
+                        reject(new Error(`HTTP ${status}: ${text}`));
+                        return;
+                    }
+                    resolve(JSON.parse(text));
+                } catch (e) {
+                    reject(e);
+                }
+            }
+        );
+    });
+}
+
+function fetchGithubGraphQL(query, variables, token) {
+    return new Promise((resolve, reject) => {
+        let message = Soup.Message.new('POST', 'https://api.github.com/graphql');
+        if (!message) {
+            reject(new Error('Invalid GraphQL URL'));
+            return;
+        }
+        message.request_headers.append('Authorization', `Bearer ${token}`);
+        message.request_headers.append('Accept', 'application/vnd.github+json');
+
+        let body = JSON.stringify({ query, variables });
+        message.set_request_body_from_bytes('application/json', new GLib.Bytes(new TextEncoder().encode(body)));
+
+        getHttpSession().send_and_read_async(
+            message, GLib.PRIORITY_DEFAULT, null,
+            (session, result) => {
+                try {
+                    let bytes = session.send_and_read_finish(result);
+                    let status = message.get_status();
+                    let text = new TextDecoder('utf-8').decode(bytes.get_data());
+                    if (status !== Soup.Status.OK) {
+                        reject(new Error(`HTTP ${status}: ${text}`));
+                        return;
+                    }
+                    let parsed = JSON.parse(text);
+                    if (parsed.errors && parsed.errors.length > 0) {
+                        reject(new Error(parsed.errors.map((e) => e.message).join('; ')));
+                        return;
+                    }
+                    resolve(parsed.data);
+                } catch (e) {
+                    reject(e);
+                }
+            }
+        );
+    });
+}
+
 const BLUEZ_SERVICE = 'org.bluez';
+function fetchBytesPlain(url) {
+    return new Promise((resolve, reject) => {
+        let message = Soup.Message.new('GET', url);
+        if (!message) {
+            reject(new Error(`Invalid URL: ${url}`));
+            return;
+        }
+        getHttpSession().send_and_read_async(
+            message, GLib.PRIORITY_DEFAULT, null,
+            (session, result) => {
+                try {
+                    let bytes = session.send_and_read_finish(result);
+                    let status = message.get_status();
+                    if (status !== Soup.Status.OK) {
+                        reject(new Error(`HTTP ${status}`));
+                        return;
+                    }
+                    resolve(bytes);
+                } catch (e) {
+                    reject(e);
+                }
+            }
+        );
+    });
+}
+
 const OM_IFACE = 'org.freedesktop.DBus.ObjectManager';
 const PROPS_IFACE = 'org.freedesktop.DBus.Properties';
 const DEVICE_IFACE = 'org.bluez.Device1';
@@ -1423,6 +1558,1086 @@ class PhotosWidget {
     }
 }
 
+const DBUS_IFACE = 'org.freedesktop.DBus';
+const MPRIS_PREFIX = 'org.mpris.MediaPlayer2.';
+const MPRIS_PLAYER_IFACE = 'org.mpris.MediaPlayer2.Player';
+const MPRIS_PATH = '/org/mpris/MediaPlayer2';
+
+class NowPlayingWidget {
+    constructor(extension) {
+        this._extension = extension;
+        this._bus = Gio.DBus.session;
+        this._pollTimeoutId = null;
+        this._propsSignalId = null;
+        this._activeBusName = null;
+        this._destroyed = false;
+    }
+
+    build() {
+        this._card = new St.BoxLayout({
+            vertical: true,
+            reactive: true,
+            style: `
+                background-color: rgba(28, 28, 30, 0.55);
+                border-radius: 20px;
+                border: 1px solid rgba(255,255,255,0.08);
+                padding: 14px;
+                min-width: 260px;
+            `,
+        });
+
+        try {
+            this._card.add_effect(new Shell.BlurEffect({
+                brightness: 0.65, sigma: 40, mode: Shell.BlurMode.BACKGROUND,
+            }));
+        } catch (e) {
+            logError(e, 'Now Playing widget: blur effect unavailable, using plain translucency');
+        }
+
+        let topRow = new St.BoxLayout({ style: 'spacing: 10px;' });
+
+        this._artBin = new St.Widget({
+            layout_manager: new Clutter.BinLayout(),
+            width: 52, height: 52,
+            style: 'border-radius: 10px; background-color: rgba(255,255,255,0.08); background-size: cover; background-position: center;',
+            clip_to_allocation: true,
+        });
+        this._artIcon = new St.Icon({
+            icon_name: 'audio-x-generic-symbolic',
+            icon_size: 24,
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.CENTER,
+            style: 'color: rgba(255,255,255,0.5);',
+        });
+        this._artBin.add_child(this._artIcon);
+        topRow.add_child(this._artBin);
+
+        let textCol = new St.BoxLayout({ vertical: true, y_align: Clutter.ActorAlign.CENTER, x_expand: true, style: 'spacing: 2px;' });
+        this._titleLabel = new St.Label({
+            text: 'Nothing playing',
+            style: 'color: rgba(255,255,255,0.92); font-size: 13px; font-weight: 600;',
+        });
+        this._artistLabel = new St.Label({
+            text: '',
+            style: 'color: rgba(255,255,255,0.6); font-size: 12px;',
+        });
+        textCol.add_child(this._titleLabel);
+        textCol.add_child(this._artistLabel);
+        topRow.add_child(textCol);
+
+        this._card.add_child(topRow);
+
+        let controls = new St.BoxLayout({
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'spacing: 8px; padding-top: 10px;',
+        });
+
+        this._prevButton = this._makeControlButton('media-skip-backward-symbolic');
+        this._playPauseButton = this._makeControlButton('media-playback-start-symbolic');
+        this._nextButton = this._makeControlButton('media-skip-forward-symbolic');
+
+        this._prevButton.connect('clicked', () => this._callPlayerMethod('Previous'));
+        this._playPauseButton.connect('clicked', () => this._callPlayerMethod('PlayPause'));
+        this._nextButton.connect('clicked', () => this._callPlayerMethod('Next'));
+
+        controls.add_child(this._prevButton);
+        controls.add_child(this._playPauseButton);
+        controls.add_child(this._nextButton);
+        this._card.add_child(controls);
+        this._controls = controls;
+        this._setControlsSensitive(false);
+
+        this._refreshPlayerList();
+        this._pollTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 4, () => {
+            this._refreshPlayerList();
+            return GLib.SOURCE_CONTINUE;
+        });
+
+        return this._card;
+    }
+
+    destroy() {
+        this._destroyed = true;
+
+        if (this._pollTimeoutId !== null) {
+            GLib.source_remove(this._pollTimeoutId);
+            this._pollTimeoutId = null;
+        }
+        this._unsubscribeProps();
+
+        this._card = null;
+        this._artBin = null;
+        this._artIcon = null;
+        this._titleLabel = null;
+        this._artistLabel = null;
+        this._controls = null;
+        this._prevButton = null;
+        this._playPauseButton = null;
+        this._nextButton = null;
+    }
+
+    _makeControlButton(iconName) {
+        return new St.Button({
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            style: 'border-radius: 999px; padding: 8px; background-color: rgba(255,255,255,0.08);',
+            child: new St.Icon({ icon_name: iconName, icon_size: 16, style: 'color: rgba(255,255,255,0.9);' }),
+        });
+    }
+
+    _setControlsSensitive(sensitive) {
+        if (!this._controls)
+            return;
+        this._controls.reactive = sensitive;
+        for (let button of [this._prevButton, this._nextButton, this._playPauseButton])
+            button.can_focus = sensitive;
+        this._controls.opacity = sensitive ? 255 : 100;
+    }
+
+    _refreshPlayerList() {
+        if (this._destroyed)
+            return;
+        try {
+            let result = this._bus.call_sync(
+                DBUS_IFACE, '/org/freedesktop/DBus', DBUS_IFACE, 'ListNames',
+                null, GLib.VariantType.new('(as)'), Gio.DBusCallFlags.NONE, -1, null
+            );
+            let names = result.deep_unpack()[0].filter((n) => n.startsWith(MPRIS_PREFIX));
+
+            if (names.length === 0) {
+                this._subscribeToPlayer(null);
+                this._renderNothingPlaying();
+                return;
+            }
+
+            let chosen = names[0];
+            for (let name of names) {
+                if (this._getPlaybackStatus(name) === 'Playing') {
+                    chosen = name;
+                    break;
+                }
+            }
+
+            if (chosen !== this._activeBusName)
+                this._subscribeToPlayer(chosen);
+
+            this._updateFromBusName(chosen);
+        } catch (e) {
+            logError(e, 'Now Playing widget: failed to list media players');
+        }
+    }
+
+    _getPlaybackStatus(busName) {
+        try {
+            let result = this._bus.call_sync(
+                busName, MPRIS_PATH, PROPS_IFACE, 'Get',
+                new GLib.Variant('(ss)', [MPRIS_PLAYER_IFACE, 'PlaybackStatus']),
+                GLib.VariantType.new('(v)'), Gio.DBusCallFlags.NONE, -1, null
+            );
+            return result.deep_unpack()[0].deep_unpack();
+        } catch (e) {
+            return null;
+        }
+    }
+
+    _subscribeToPlayer(busName) {
+        this._unsubscribeProps();
+        this._activeBusName = busName;
+        if (!busName)
+            return;
+        this._propsSignalId = this._bus.signal_subscribe(
+            busName, PROPS_IFACE, 'PropertiesChanged', MPRIS_PATH, null,
+            Gio.DBusSignalFlags.NONE,
+            () => this._updateFromBusName(busName)
+        );
+    }
+
+    _unsubscribeProps() {
+        if (this._propsSignalId !== null) {
+            this._bus.signal_unsubscribe(this._propsSignalId);
+            this._propsSignalId = null;
+        }
+    }
+
+    _updateFromBusName(busName) {
+        if (this._destroyed || !busName) {
+            this._renderNothingPlaying();
+            return;
+        }
+        try {
+            let result = this._bus.call_sync(
+                busName, MPRIS_PATH, PROPS_IFACE, 'GetAll',
+                new GLib.Variant('(s)', [MPRIS_PLAYER_IFACE]),
+                GLib.VariantType.new('(a{sv})'), Gio.DBusCallFlags.NONE, -1, null
+            );
+            let props = unpackVariantDict(result.deep_unpack()[0]);
+            let metadata = props.Metadata || {};
+            let title = metadata['xesam:title'] || 'Unknown title';
+            let artistField = metadata['xesam:artist'];
+            let artist = Array.isArray(artistField) ? artistField.join(', ') : (artistField || '');
+            let artUrl = metadata['mpris:artUrl'] || '';
+            let status = props.PlaybackStatus || 'Stopped';
+
+            this._render({ title, artist, artUrl, status, busName });
+        } catch (e) {
+            this._renderNothingPlaying();
+        }
+    }
+
+    _render(data) {
+        if (!this._card)
+            return;
+
+        this._setControlsSensitive(true);
+        this._titleLabel.text = data.title;
+        this._artistLabel.text = data.artist;
+        this._playPauseButton.child.icon_name = data.status === 'Playing'
+            ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic';
+
+        this._applyArt(data.artUrl);
+    }
+
+    _renderNothingPlaying() {
+        if (!this._card)
+            return;
+        this._titleLabel.text = 'Nothing playing';
+        this._artistLabel.text = '';
+        this._artBin.style = 'border-radius: 10px; background-color: rgba(255,255,255,0.08);';
+        this._artIcon.show();
+        this._setControlsSensitive(false);
+    }
+
+    _applyArt(artUrl) {
+        if (!artUrl) {
+            this._artBin.style = 'border-radius: 10px; background-color: rgba(255,255,255,0.08);';
+            this._artIcon.show();
+            return;
+        }
+
+        if (artUrl.startsWith('file://')) {
+            this._artIcon.hide();
+            this._artBin.style = `border-radius: 10px; background-size: cover; background-position: center; background-image: url("${artUrl}");`;
+            return;
+        }
+
+        if (!artUrl.startsWith('http://') && !artUrl.startsWith('https://')) {
+            this._artBin.style = 'border-radius: 10px; background-color: rgba(255,255,255,0.08);';
+            this._artIcon.show();
+            return;
+        }
+
+        if (this._lastFetchedArtUrl === artUrl)
+            return;
+        this._lastFetchedArtUrl = artUrl;
+
+        fetchBytesPlain(artUrl).then((bytes) => {
+            if (this._destroyed || !this._artBin)
+                return;
+            let dir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'glance-widgets', 'nowplaying']);
+            GLib.mkdir_with_parents(dir, 0o700);
+            let path = GLib.build_filenamev([dir, 'art.jpg']);
+            try {
+                let file = Gio.File.new_for_path(path);
+                file.replace_contents(bytes.get_data(), null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+            } catch (e) {
+                logError(e, 'Now Playing widget: failed to cache album art');
+                return;
+            }
+            this._artIcon.hide();
+            this._artBin.style = `border-radius: 10px; background-size: cover; background-position: center; background-image: url("file://${path}");`;
+        }).catch((e) => {
+            logError(e, 'Now Playing widget: failed to fetch album art');
+        });
+    }
+
+    _callPlayerMethod(method) {
+        if (!this._activeBusName)
+            return;
+        this._bus.call(
+            this._activeBusName, MPRIS_PATH, MPRIS_PLAYER_IFACE, method,
+            null, null, Gio.DBusCallFlags.NONE, -1, null,
+            (connection, result) => {
+                try {
+                    connection.call_finish(result);
+                } catch (e) {
+                    logError(e, `Now Playing widget: ${method} failed`);
+                }
+            }
+        );
+    }
+}
+
+class QuickTogglesWidget {
+    constructor(extension) {
+        this._extension = extension;
+        this._notifSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.notifications' });
+        this._colorSettings = null;
+        this._interfaceSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.interface' });
+        try {
+            this._colorSettings = new Gio.Settings({ schema_id: 'org.gnome.settings-daemon.plugins.color' });
+        } catch (e) {
+            logError(e, 'Quick Toggles widget: night light schema unavailable');
+        }
+        this._signalIds = [];
+    }
+
+    build() {
+        this._card = new St.BoxLayout({
+            vertical: true,
+            reactive: true,
+            style: `
+                background-color: rgba(28, 28, 30, 0.55);
+                border-radius: 20px;
+                border: 1px solid rgba(255,255,255,0.08);
+                padding: 14px;
+                min-width: 260px;
+            `,
+        });
+
+        try {
+            this._card.add_effect(new Shell.BlurEffect({
+                brightness: 0.65, sigma: 40, mode: Shell.BlurMode.BACKGROUND,
+            }));
+        } catch (e) {
+            logError(e, 'Quick Toggles widget: blur effect unavailable, using plain translucency');
+        }
+
+        this._card.add_child(new St.Label({
+            text: 'Quick Toggles',
+            style: `
+                font-weight: 700;
+                font-size: 15px;
+                color: rgba(255,255,255,0.92);
+                padding-bottom: 10px;
+                padding-left: 4px;
+            `,
+        }));
+
+        let row = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER, style: 'spacing: 12px;' });
+
+        this._dndButton = this._makeToggleButton('notifications-symbolic', 'Do Not Disturb');
+        this._dndButton.connect('clicked', () => {
+            let dndCurrentlyOn = !this._notifSettings.get_boolean('show-banners');
+            this._notifSettings.set_boolean('show-banners', dndCurrentlyOn);
+        });
+        row.add_child(this._dndButton);
+
+        if (this._colorSettings) {
+            this._nightLightButton = this._makeToggleButton('night-light-symbolic', 'Night Light');
+            this._nightLightButton.connect('clicked', () => {
+                let current = this._colorSettings.get_boolean('night-light-enabled');
+                this._colorSettings.set_boolean('night-light-enabled', !current);
+            });
+            row.add_child(this._nightLightButton);
+        }
+
+        this._darkModeButton = this._makeToggleButton('weather-clear-night-symbolic', 'Dark Mode');
+        this._darkModeButton.connect('clicked', () => {
+            let isDark = this._interfaceSettings.get_string('color-scheme') === 'prefer-dark';
+            this._interfaceSettings.set_string('color-scheme', isDark ? 'default' : 'prefer-dark');
+        });
+        row.add_child(this._darkModeButton);
+
+        this._card.add_child(row);
+
+        this._signalIds.push([this._notifSettings, this._notifSettings.connect('changed::show-banners', () => this._syncState())]);
+        if (this._colorSettings)
+            this._signalIds.push([this._colorSettings, this._colorSettings.connect('changed::night-light-enabled', () => this._syncState())]);
+        this._signalIds.push([this._interfaceSettings, this._interfaceSettings.connect('changed::color-scheme', () => this._syncState())]);
+
+        this._syncState();
+
+        return this._card;
+    }
+
+    destroy() {
+        for (let [settingsObj, id] of this._signalIds)
+            settingsObj.disconnect(id);
+        this._signalIds = [];
+
+        this._card = null;
+        this._dndButton = null;
+        this._nightLightButton = null;
+        this._darkModeButton = null;
+    }
+
+    _makeToggleButton(iconName, accessibleName) {
+        return new St.Button({
+            reactive: true,
+            can_focus: true,
+            track_hover: true,
+            accessible_name: accessibleName,
+            style: 'border-radius: 14px; padding: 12px; background-color: rgba(255,255,255,0.08);',
+            child: new St.Icon({ icon_name: iconName, icon_size: 20, style: 'color: rgba(255,255,255,0.85);' }),
+        });
+    }
+
+    _setButtonActive(button, active) {
+        if (!button)
+            return;
+        button.style = active
+            ? 'border-radius: 14px; padding: 12px; background-color: rgba(10, 132, 255, 0.85);'
+            : 'border-radius: 14px; padding: 12px; background-color: rgba(255,255,255,0.08);';
+    }
+
+    _syncState() {
+        this._setButtonActive(this._dndButton, !this._notifSettings.get_boolean('show-banners'));
+        if (this._colorSettings)
+            this._setButtonActive(this._nightLightButton, this._colorSettings.get_boolean('night-light-enabled'));
+        this._setButtonActive(this._darkModeButton, this._interfaceSettings.get_string('color-scheme') === 'prefer-dark');
+    }
+}
+
+class GithubPRWidget {
+    constructor(extension) {
+        this._extension = extension;
+        this._settings = extension.getSettings(SETTINGS_SCHEMA);
+        this._settingsChangedId = null;
+        this._refreshTimeoutId = null;
+        this._destroyed = false;
+    }
+
+    build() {
+        this._card = new St.BoxLayout({
+            vertical: true,
+            reactive: true,
+            style: `
+                background-color: rgba(28, 28, 30, 0.55);
+                border-radius: 20px;
+                border: 1px solid rgba(255,255,255,0.08);
+                padding: 14px;
+                min-width: 260px;
+            `,
+        });
+
+        try {
+            this._card.add_effect(new Shell.BlurEffect({
+                brightness: 0.65, sigma: 40, mode: Shell.BlurMode.BACKGROUND,
+            }));
+        } catch (e) {
+            logError(e, 'GitHub PRs widget: blur effect unavailable, using plain translucency');
+        }
+
+        this._card.add_child(new St.Label({
+            text: 'GitHub',
+            style: `
+                font-weight: 700;
+                font-size: 15px;
+                color: rgba(255,255,255,0.92);
+                padding-bottom: 8px;
+                padding-left: 4px;
+            `,
+        }));
+
+        this._contentBox = new St.BoxLayout({ vertical: true, style: 'spacing: 6px;' });
+
+        this._openPrRow = this._buildStatRow('merge-symbolic', 'Open PRs');
+        this._reviewRow = this._buildStatRow('emblem-important-symbolic', 'Review requests');
+        this._contentBox.add_child(this._openPrRow.row);
+        this._contentBox.add_child(this._reviewRow.row);
+        this._card.add_child(this._contentBox);
+
+        this._statusLabel = new St.Label({
+            text: 'Loading…',
+            style: 'color: rgba(255,255,255,0.5); font-size: 13px; padding: 6px 4px;',
+        });
+        this._card.add_child(this._statusLabel);
+
+        this._settingsChangedId = this._settings.connect('changed::github-username', () => this.refresh());
+
+        this.refresh();
+        this._refreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 300, () => {
+            this.refresh();
+            return GLib.SOURCE_CONTINUE;
+        });
+
+        return this._card;
+    }
+
+    refresh() {
+        this._load().catch((e) => {
+            if (this._destroyed)
+                return;
+            logError(e, 'GitHub PRs widget: failed to load');
+            this._showStatus('Unable to reach GitHub');
+        });
+    }
+
+    destroy() {
+        this._destroyed = true;
+        if (this._settingsChangedId !== null) {
+            this._settings.disconnect(this._settingsChangedId);
+            this._settingsChangedId = null;
+        }
+        if (this._refreshTimeoutId !== null) {
+            GLib.source_remove(this._refreshTimeoutId);
+            this._refreshTimeoutId = null;
+        }
+        this._card = null;
+        this._contentBox = null;
+        this._statusLabel = null;
+    }
+
+    _buildStatRow(iconName, label) {
+        let row = new St.BoxLayout({ style: 'spacing: 8px;' });
+        row.add_child(new St.Icon({ icon_name: iconName, icon_size: 16, style: 'color: rgba(255,255,255,0.7);' }));
+        let textLabel = new St.Label({
+            text: label,
+            y_align: Clutter.ActorAlign.CENTER,
+            x_expand: true,
+            style: 'color: rgba(255,255,255,0.8); font-size: 13px;',
+        });
+        let countLabel = new St.Label({
+            text: '—',
+            y_align: Clutter.ActorAlign.CENTER,
+            style: 'color: rgba(255,255,255,0.92); font-size: 15px; font-weight: 700;',
+        });
+        row.add_child(textLabel);
+        row.add_child(countLabel);
+        return { row, countLabel };
+    }
+
+    async _load() {
+        let username = this._settings.get_string('github-username');
+        if (!username) {
+            this._showStatus('Configure GitHub in preferences');
+            return;
+        }
+
+        let token = await lookupGithubToken(this._settings);
+        if (this._destroyed)
+            return;
+        if (!token) {
+            this._showStatus('No GitHub token found — configure in preferences');
+            return;
+        }
+
+        let authoredQuery = encodeURIComponent(`is:open is:pr author:${username}`);
+        let reviewQuery = encodeURIComponent(`is:open is:pr review-requested:${username}`);
+
+        let [authored, reviewRequested] = await Promise.all([
+            fetchGithubJson(`https://api.github.com/search/issues?q=${authoredQuery}`, token),
+            fetchGithubJson(`https://api.github.com/search/issues?q=${reviewQuery}`, token),
+        ]);
+
+        if (this._destroyed || !this._contentBox)
+            return;
+
+        this._statusLabel.hide();
+        this._contentBox.show();
+        this._openPrRow.countLabel.text = `${authored.total_count}`;
+        this._reviewRow.countLabel.text = `${reviewRequested.total_count}`;
+    }
+
+    _showStatus(text) {
+        if (!this._statusLabel)
+            return;
+        this._contentBox.hide();
+        this._statusLabel.text = text;
+        this._statusLabel.show();
+    }
+}
+
+const GITHUB_HEATMAP_QUERY = `
+query($login: String!) {
+  user(login: $login) {
+    contributionsCollection {
+      contributionCalendar {
+        totalContributions
+        weeks {
+          contributionDays {
+            date
+            contributionCount
+            color
+          }
+        }
+      }
+    }
+  }
+}`;
+
+const HEATMAP_SQUARE = 9;
+const HEATMAP_GAP = 3;
+const HEATMAP_ROWS = 7;
+const HEATMAP_WIDTH = 232;
+const HEATMAP_HEIGHT = HEATMAP_ROWS * (HEATMAP_SQUARE + HEATMAP_GAP) - HEATMAP_GAP;
+
+class GithubHeatmapWidget {
+    constructor(extension) {
+        this._extension = extension;
+        this._settings = extension.getSettings(SETTINGS_SCHEMA);
+        this._settingsChangedId = null;
+        this._refreshTimeoutId = null;
+        this._weeks = null;
+        this._destroyed = false;
+    }
+
+    build() {
+        this._card = new St.BoxLayout({
+            vertical: true,
+            reactive: true,
+            style: `
+                background-color: rgba(28, 28, 30, 0.55);
+                border-radius: 20px;
+                border: 1px solid rgba(255,255,255,0.08);
+                padding: 14px;
+                min-width: 260px;
+            `,
+        });
+
+        try {
+            this._card.add_effect(new Shell.BlurEffect({
+                brightness: 0.65, sigma: 40, mode: Shell.BlurMode.BACKGROUND,
+            }));
+        } catch (e) {
+            logError(e, 'GitHub Heatmap widget: blur effect unavailable, using plain translucency');
+        }
+
+        this._card.add_child(new St.Label({
+            text: 'Contributions',
+            style: `
+                font-weight: 700;
+                font-size: 15px;
+                color: rgba(255,255,255,0.92);
+                padding-bottom: 8px;
+                padding-left: 4px;
+            `,
+        }));
+
+        this._area = new St.DrawingArea({ width: HEATMAP_WIDTH, height: HEATMAP_HEIGHT });
+        this._area.connect('repaint', (a) => this._paint(a));
+        let wrap = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER });
+        wrap.add_child(this._area);
+        this._card.add_child(wrap);
+
+        this._captionLabel = new St.Label({
+            x_align: Clutter.ActorAlign.CENTER,
+            style: 'color: rgba(255,255,255,0.5); font-size: 12px; padding-top: 8px;',
+        });
+        let captionWrap = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER });
+        captionWrap.add_child(this._captionLabel);
+        this._card.add_child(captionWrap);
+
+        this._statusLabel = new St.Label({
+            text: 'Loading…',
+            style: 'color: rgba(255,255,255,0.5); font-size: 13px; padding: 6px 4px;',
+        });
+        this._card.add_child(this._statusLabel);
+
+        this._settingsChangedId = this._settings.connect('changed::github-username', () => this.refresh());
+
+        this.refresh();
+        this._refreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 21600, () => {
+            this.refresh();
+            return GLib.SOURCE_CONTINUE;
+        });
+
+        return this._card;
+    }
+
+    refresh() {
+        this._load().catch((e) => {
+            if (this._destroyed)
+                return;
+            logError(e, 'GitHub Heatmap widget: failed to load');
+            this._showStatus('Unable to reach GitHub');
+        });
+    }
+
+    destroy() {
+        this._destroyed = true;
+        if (this._settingsChangedId !== null) {
+            this._settings.disconnect(this._settingsChangedId);
+            this._settingsChangedId = null;
+        }
+        if (this._refreshTimeoutId !== null) {
+            GLib.source_remove(this._refreshTimeoutId);
+            this._refreshTimeoutId = null;
+        }
+        this._card = null;
+        this._area = null;
+        this._captionLabel = null;
+        this._statusLabel = null;
+    }
+
+    async _load() {
+        let username = this._settings.get_string('github-username');
+        if (!username) {
+            this._showStatus('Configure GitHub in preferences');
+            return;
+        }
+
+        let token = await lookupGithubToken(this._settings);
+        if (this._destroyed)
+            return;
+        if (!token) {
+            this._showStatus('No GitHub token found — configure in preferences');
+            return;
+        }
+
+        let data = await fetchGithubGraphQL(GITHUB_HEATMAP_QUERY, { login: username }, token);
+        if (this._destroyed || !this._area)
+            return;
+
+        let calendar = data && data.user && data.user.contributionsCollection.contributionCalendar;
+        if (!calendar) {
+            this._showStatus('No contribution data found for this user');
+            return;
+        }
+
+        this._weeks = calendar.weeks;
+        this._statusLabel.hide();
+        this._area.show();
+        this._captionLabel.text = `${calendar.totalContributions} contributions in the last year`;
+        this._area.queue_repaint();
+    }
+
+    _showStatus(text) {
+        if (!this._statusLabel)
+            return;
+        this._area.hide();
+        this._captionLabel.text = '';
+        this._statusLabel.text = text;
+        this._statusLabel.show();
+    }
+
+    _paint(area) {
+        if (!this._weeks)
+            return;
+
+        let cr = area.get_context();
+        let [w] = area.get_surface_size();
+        let columns = Math.max(1, Math.floor((w + HEATMAP_GAP) / (HEATMAP_SQUARE + HEATMAP_GAP)));
+        let weeks = this._weeks.slice(-columns);
+
+        weeks.forEach((week, i) => {
+            week.contributionDays.forEach((day, j) => {
+                let x = i * (HEATMAP_SQUARE + HEATMAP_GAP);
+                let y = j * (HEATMAP_SQUARE + HEATMAP_GAP);
+                this._setSourceFromColor(cr, day.contributionCount > 0 ? day.color : null);
+                cr.rectangle(x, y, HEATMAP_SQUARE, HEATMAP_SQUARE);
+                cr.fill();
+            });
+        });
+
+        cr.$dispose();
+    }
+
+    _setSourceFromColor(cr, hexColor) {
+        if (hexColor && hexColor.startsWith('#') && hexColor.length >= 7) {
+            let r = parseInt(hexColor.slice(1, 3), 16) / 255;
+            let g = parseInt(hexColor.slice(3, 5), 16) / 255;
+            let b = parseInt(hexColor.slice(5, 7), 16) / 255;
+            cr.setSourceRGB(r, g, b);
+        } else {
+            cr.setSourceRGBA(1, 1, 1, 0.08);
+        }
+    }
+}
+
+class CalendarWidget {
+    constructor(extension) {
+        this._extension = extension;
+        this._settings = extension.getSettings(SETTINGS_SCHEMA);
+        this._settingsChangedId = null;
+        this._refreshTimeoutId = null;
+    }
+
+    build() {
+        this._card = new St.BoxLayout({
+            vertical: true,
+            reactive: true,
+            style: `
+                background-color: rgba(28, 28, 30, 0.55);
+                border-radius: 20px;
+                border: 1px solid rgba(255,255,255,0.08);
+                padding: 14px;
+                min-width: 260px;
+            `,
+        });
+
+        try {
+            this._card.add_effect(new Shell.BlurEffect({
+                brightness: 0.65, sigma: 40, mode: Shell.BlurMode.BACKGROUND,
+            }));
+        } catch (e) {
+            logError(e, 'Calendar widget: blur effect unavailable, using plain translucency');
+        }
+
+        this._headerLabel = new St.Label({
+            style: `
+                font-weight: 700;
+                font-size: 15px;
+                color: rgba(255,255,255,0.92);
+                padding-bottom: 10px;
+                padding-left: 4px;
+            `,
+        });
+        this._card.add_child(this._headerLabel);
+
+        this._grid = new St.Widget({
+            layout_manager: new Clutter.GridLayout({ column_spacing: 6, row_spacing: 6 }),
+        });
+        let wrap = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER });
+        wrap.add_child(this._grid);
+        this._card.add_child(wrap);
+
+        this._settingsChangedId = this._settings.connect('changed::calendar-week-start', () => this._render());
+
+        this._render();
+        // Cheap to re-render hourly; catches both the date rollover and any
+        // week-start setting change without needing precise midnight timing.
+        this._refreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3600, () => {
+            this._render();
+            return GLib.SOURCE_CONTINUE;
+        });
+
+        return this._card;
+    }
+
+    refresh() {
+        this._render();
+    }
+
+    destroy() {
+        if (this._settingsChangedId !== null) {
+            this._settings.disconnect(this._settingsChangedId);
+            this._settingsChangedId = null;
+        }
+        if (this._refreshTimeoutId !== null) {
+            GLib.source_remove(this._refreshTimeoutId);
+            this._refreshTimeoutId = null;
+        }
+        this._card = null;
+        this._headerLabel = null;
+        this._grid = null;
+    }
+
+    _daysInMonth(year, month) {
+        let firstOfThis = GLib.DateTime.new_local(year, month, 1, 0, 0, 0);
+        let firstOfNext = month === 12
+            ? GLib.DateTime.new_local(year + 1, 1, 1, 0, 0, 0)
+            : GLib.DateTime.new_local(year, month + 1, 1, 0, 0, 0);
+        let diffMicroseconds = firstOfNext.difference(firstOfThis);
+        return Math.round(diffMicroseconds / (24 * 3600 * 1000000));
+    }
+
+    _render() {
+        if (!this._grid)
+            return;
+
+        this._grid.destroy_all_children();
+        let layout = this._grid.layout_manager;
+
+        let now = GLib.DateTime.new_now_local();
+        this._headerLabel.text = now.format('%B %Y');
+
+        let weekStartsSunday = this._settings.get_string('calendar-week-start') === 'sunday';
+        let dowLabels = weekStartsSunday
+            ? ['S', 'M', 'T', 'W', 'T', 'F', 'S']
+            : ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
+        dowLabels.forEach((label, col) => {
+            layout.attach(new St.Label({
+                text: label,
+                x_align: Clutter.ActorAlign.CENTER,
+                style: 'color: rgba(255,255,255,0.4); font-size: 11px; font-weight: 600; min-width: 24px;',
+            }), col, 0, 1, 1);
+        });
+
+        let year = now.get_year();
+        let month = now.get_month();
+        let firstOfMonth = GLib.DateTime.new_local(year, month, 1, 0, 0, 0);
+        let firstWeekday = firstOfMonth.get_day_of_week(); // GLib: Monday=1 ... Sunday=7
+        let offset = weekStartsSunday ? firstWeekday % 7 : firstWeekday - 1;
+
+        let daysInMonth = this._daysInMonth(year, month);
+        let today = now.get_day_of_month();
+
+        let row = 1;
+        let col = offset;
+        for (let day = 1; day <= daysInMonth; day++) {
+            let isToday = day === today;
+            layout.attach(new St.Label({
+                text: `${day}`,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                style: isToday
+                    ? 'color: white; font-size: 12px; font-weight: 700; background-color: rgba(10,132,255,0.9); border-radius: 999px; padding: 4px 0; min-width: 24px;'
+                    : 'color: rgba(255,255,255,0.85); font-size: 12px; padding: 4px 0; min-width: 24px;',
+            }), col, row, 1, 1);
+
+            col++;
+            if (col > 6) {
+                col = 0;
+                row++;
+            }
+        }
+    }
+}
+
+const QUICKLAUNCH_COLUMNS = 4;
+const QUICKLAUNCH_ROWS = 2;
+const QUICKLAUNCH_MAX_APPS = QUICKLAUNCH_COLUMNS * QUICKLAUNCH_ROWS;
+
+class QuickLaunchWidget {
+    constructor(extension) {
+        this._extension = extension;
+        this._settings = extension.getSettings(SETTINGS_SCHEMA);
+        this._settingsChangedId = null;
+        this._refreshTimeoutId = null;
+    }
+
+    build() {
+        this._card = new St.BoxLayout({
+            vertical: true,
+            reactive: true,
+            style: `
+                background-color: rgba(28, 28, 30, 0.55);
+                border-radius: 20px;
+                border: 1px solid rgba(255,255,255,0.08);
+                padding: 14px;
+                min-width: 260px;
+            `,
+        });
+
+        try {
+            this._card.add_effect(new Shell.BlurEffect({
+                brightness: 0.65, sigma: 40, mode: Shell.BlurMode.BACKGROUND,
+            }));
+        } catch (e) {
+            logError(e, 'Quick Launch widget: blur effect unavailable, using plain translucency');
+        }
+
+        this._card.add_child(new St.Label({
+            text: 'Quick Launch',
+            style: `
+                font-weight: 700;
+                font-size: 15px;
+                color: rgba(255,255,255,0.92);
+                padding-bottom: 10px;
+                padding-left: 4px;
+            `,
+        }));
+
+        this._grid = new St.Widget({
+            layout_manager: new Clutter.GridLayout({ column_spacing: 10, row_spacing: 10 }),
+        });
+        let wrap = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER });
+        wrap.add_child(this._grid);
+        this._card.add_child(wrap);
+
+        this._settingsChangedId = this._settings.connect('changed::quicklaunch-pinned-apps', () => this._render());
+
+        this._render();
+        // Most-used ranking can shift over time; a light periodic re-render
+        // keeps it current without needing an explicit usage-changed signal.
+        this._refreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 60, () => {
+            this._render();
+            return GLib.SOURCE_CONTINUE;
+        });
+
+        return this._card;
+    }
+
+    refresh() {
+        this._render();
+    }
+
+    destroy() {
+        if (this._settingsChangedId !== null) {
+            this._settings.disconnect(this._settingsChangedId);
+            this._settingsChangedId = null;
+        }
+        if (this._refreshTimeoutId !== null) {
+            GLib.source_remove(this._refreshTimeoutId);
+            this._refreshTimeoutId = null;
+        }
+        this._card = null;
+        this._grid = null;
+    }
+
+    _loadPinnedIds() {
+        try {
+            let parsed = JSON.parse(this._settings.get_string('quicklaunch-pinned-apps'));
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    _computeAppList() {
+        let appSystem = Shell.AppSystem.get_default();
+        let pinnedIds = this._loadPinnedIds();
+        let pinnedApps = pinnedIds
+            .map((id) => appSystem.lookup_app(id))
+            .filter((app) => app !== null);
+
+        let usedApps = [];
+        try {
+            usedApps = Shell.AppUsage.get_default().get_most_used().filter((app) => app !== null);
+        } catch (e) {
+            logError(e, 'Quick Launch widget: failed to read app usage data');
+        }
+
+        let seenIds = new Set(pinnedApps.map((app) => app.get_id()));
+        let combined = [...pinnedApps];
+
+        for (let app of usedApps) {
+            if (combined.length >= QUICKLAUNCH_MAX_APPS)
+                break;
+            if (seenIds.has(app.get_id()))
+                continue;
+            combined.push(app);
+            seenIds.add(app.get_id());
+        }
+
+        return combined.slice(0, QUICKLAUNCH_MAX_APPS);
+    }
+
+    _render() {
+        if (!this._grid)
+            return;
+
+        this._grid.destroy_all_children();
+        let layout = this._grid.layout_manager;
+
+        let apps = this._computeAppList();
+
+        if (apps.length === 0) {
+            layout.attach(new St.Label({
+                text: 'Pin apps in preferences to see them here',
+                style: 'color: rgba(255,255,255,0.5); font-size: 12px;',
+            }), 0, 0, QUICKLAUNCH_COLUMNS, 1);
+            return;
+        }
+
+        apps.forEach((app, index) => {
+            let col = index % QUICKLAUNCH_COLUMNS;
+            let row = Math.floor(index / QUICKLAUNCH_COLUMNS);
+
+            let button = new St.Button({
+                reactive: true,
+                can_focus: true,
+                track_hover: true,
+                accessible_name: app.get_name(),
+                style: 'border-radius: 12px; padding: 6px; background-color: rgba(255,255,255,0.06);',
+                child: app.create_icon_texture(42),
+            });
+            button.connect('clicked', () => {
+                try {
+                    app.activate();
+                } catch (e) {
+                    logError(e, `Quick Launch widget: failed to launch "${app.get_id()}"`);
+                }
+            });
+
+            layout.attach(button, col, row, 1, 1);
+        });
+    }
+}
+
 const WIDGET_DEFS = {
     bluetooth: {
         name: 'Bluetooth',
@@ -1448,6 +2663,36 @@ const WIDGET_DEFS = {
         name: 'Photos',
         icon: 'image-x-generic-symbolic',
         create: (extension) => new PhotosWidget(extension),
+    },
+    nowplaying: {
+        name: 'Now Playing',
+        icon: 'audio-x-generic-symbolic',
+        create: (extension) => new NowPlayingWidget(extension),
+    },
+    quicktoggles: {
+        name: 'Quick Toggles',
+        icon: 'emblem-system-symbolic',
+        create: (extension) => new QuickTogglesWidget(extension),
+    },
+    'github-prs': {
+        name: 'GitHub PRs',
+        icon: 'merge-symbolic',
+        create: (extension) => new GithubPRWidget(extension),
+    },
+    'github-heatmap': {
+        name: 'GitHub Contributions',
+        icon: 'view-grid-symbolic',
+        create: (extension) => new GithubHeatmapWidget(extension),
+    },
+    calendar: {
+        name: 'Calendar',
+        icon: 'x-office-calendar-symbolic',
+        create: (extension) => new CalendarWidget(extension),
+    },
+    quicklaunch: {
+        name: 'Quick Launch',
+        icon: 'view-app-grid-symbolic',
+        create: (extension) => new QuickLaunchWidget(extension),
     },
 };
 

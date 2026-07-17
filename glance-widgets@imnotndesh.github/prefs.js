@@ -1,6 +1,7 @@
 import Adw from 'gi://Adw';
 import Gtk from 'gi://Gtk';
 import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
 import Soup from 'gi://Soup?version=3.0';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
@@ -44,6 +45,48 @@ const WIDGET_CATALOG = [
         icon: 'drive-harddisk-symbolic',
         implemented: true,
         buildSettings: buildStorageSettingsGroup,
+    },
+    {
+        id: 'nowplaying',
+        name: 'Now Playing',
+        icon: 'audio-x-generic-symbolic',
+        implemented: true,
+        buildSettings: null,
+    },
+    {
+        id: 'quicktoggles',
+        name: 'Quick Toggles',
+        icon: 'emblem-system-symbolic',
+        implemented: true,
+        buildSettings: null,
+    },
+    {
+        id: 'github-prs',
+        name: 'GitHub PRs',
+        icon: 'merge-symbolic',
+        implemented: true,
+        buildSettings: buildGithubSettingsGroup,
+    },
+    {
+        id: 'github-heatmap',
+        name: 'GitHub Contributions',
+        icon: 'view-grid-symbolic',
+        implemented: true,
+        buildSettings: null, // shares the "GitHub" settings group above
+    },
+    {
+        id: 'calendar',
+        name: 'Calendar',
+        icon: 'x-office-calendar-symbolic',
+        implemented: true,
+        buildSettings: buildCalendarSettingsGroup,
+    },
+    {
+        id: 'quicklaunch',
+        name: 'Quick Launch',
+        icon: 'view-app-grid-symbolic',
+        implemented: true,
+        buildSettings: buildQuickLaunchSettingsGroup,
     },
 ];
 
@@ -526,6 +569,315 @@ function buildPhotosSettingsGroup(settings) {
         subtitle: 'Generate an API key in Immich under Account Settings → API Keys. The key is stored in your system keyring, not in plain settings.',
     });
     group.add(hint);
+
+    return group;
+}
+
+// --- GitHub (PR count + contribution heatmap widgets) helpers ----------
+
+let _githubSecretSchema = null;
+async function getGithubSecretSchema() {
+    let Secret = await getSecretModule();
+    if (!Secret)
+        return null;
+    if (!_githubSecretSchema) {
+        _githubSecretSchema = new Secret.Schema(
+            'org.gnome.shell.extensions.glance-widgets.github',
+            Secret.SchemaFlags.NONE,
+            { 'account': Secret.SchemaAttributeType.STRING }
+        );
+    }
+    return _githubSecretSchema;
+}
+
+async function storeGithubToken(token, settings) {
+    let Secret = await getSecretModule();
+    let schema = await getGithubSecretSchema();
+
+    if (!Secret || !schema) {
+        settings.set_string('github-token-plain', token);
+        return;
+    }
+
+    await new Promise((resolve) => {
+        Secret.password_store(
+            schema, { 'account': 'github' }, Secret.COLLECTION_DEFAULT,
+            'GitHub Token', token, null,
+            (source, result) => {
+                try {
+                    Secret.password_store_finish(result);
+                    settings.set_string('github-token-plain', '');
+                } catch (e) {
+                    logError(e, 'Glance Widgets prefs: failed to store GitHub token in keyring, falling back to GSettings');
+                    settings.set_string('github-token-plain', token);
+                }
+                resolve();
+            }
+        );
+    });
+}
+
+async function lookupGithubToken(settings) {
+    let Secret = await getSecretModule();
+    let schema = await getGithubSecretSchema();
+
+    if (!Secret || !schema)
+        return settings.get_string('github-token-plain') || null;
+
+    return new Promise((resolve) => {
+        Secret.password_lookup(
+            schema, { 'account': 'github' }, null,
+            (source, result) => {
+                let token = null;
+                try {
+                    token = Secret.password_lookup_finish(result);
+                } catch (e) {
+                    logError(e, 'Glance Widgets prefs: failed to look up GitHub token');
+                }
+                resolve(token || settings.get_string('github-token-plain') || null);
+            }
+        );
+    });
+}
+
+function githubRequest(url, token, callback) {
+    let session = new Soup.Session();
+    session.timeout = 10;
+    let message = Soup.Message.new('GET', url);
+    if (!message) {
+        callback(false, `Invalid URL: ${url}`);
+        return;
+    }
+    message.request_headers.append('Authorization', `Bearer ${token}`);
+    message.request_headers.append('Accept', 'application/vnd.github+json');
+
+    session.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session_, result) => {
+        try {
+            let bytes = session_.send_and_read_finish(result);
+            let status = message.get_status();
+            let text = new TextDecoder('utf-8').decode(bytes.get_data());
+            if (status !== Soup.Status.OK) {
+                callback(false, `HTTP ${status}`);
+                return;
+            }
+            callback(true, JSON.parse(text));
+        } catch (e) {
+            callback(false, e.message);
+        }
+    });
+}
+
+function testGithubConnection(token, callback) {
+    githubRequest('https://api.github.com/user', token, (ok, dataOrError) => {
+        if (!ok) {
+            callback(false, dataOrError);
+            return;
+        }
+        callback(true, dataOrError.login);
+    });
+}
+
+function buildGithubSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'GitHub',
+        description: 'Powers both the "GitHub PRs" and "GitHub Contributions" widgets',
+    });
+
+    let tokenRow = new Adw.PasswordEntryRow({ title: 'Personal Access Token' });
+    group.add(tokenRow);
+
+    lookupGithubToken(settings).then((token) => {
+        if (token)
+            tokenRow.set_text(token);
+    });
+
+    let existingUsername = settings.get_string('github-username');
+    let statusRow = new Adw.ActionRow({
+        title: 'Status',
+        subtitle: existingUsername ? `Connected as ${existingUsername}` : 'Not connected',
+    });
+    group.add(statusRow);
+
+    let testButton = new Gtk.Button({
+        label: 'Test Connection',
+        valign: Gtk.Align.CENTER,
+        css_classes: ['suggested-action'],
+    });
+    let testRow = new Adw.ActionRow({ title: 'Connect' });
+    testRow.add_suffix(testButton);
+    testRow.activatable_widget = testButton;
+    group.add(testRow);
+
+    testButton.connect('clicked', () => {
+        let token = tokenRow.get_text().trim();
+        if (!token) {
+            statusRow.subtitle = 'Please enter a personal access token';
+            return;
+        }
+
+        testButton.sensitive = false;
+        statusRow.subtitle = 'Testing…';
+
+        testGithubConnection(token, (ok, loginOrError) => {
+            testButton.sensitive = true;
+
+            if (!ok) {
+                statusRow.subtitle = `Connection failed: ${loginOrError}`;
+                return;
+            }
+
+            settings.set_string('github-username', loginOrError);
+            storeGithubToken(token, settings).catch((e) =>
+                logError(e, 'Glance Widgets prefs: failed to save GitHub token'));
+            statusRow.subtitle = `Connected as ${loginOrError}`;
+        });
+    });
+
+    let hint = new Adw.ActionRow({
+        subtitle: 'Generate a token at github.com → Settings → Developer settings → Personal access tokens, with "repo" and "read:user" scopes. It\'s stored in your system keyring, not in plain settings.',
+    });
+    group.add(hint);
+
+    return group;
+}
+
+function buildCalendarSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Calendar',
+        description: 'Configure the Calendar widget',
+    });
+
+    let row = new Adw.ComboRow({
+        title: 'Week starts on',
+        model: new Gtk.StringList({ strings: ['Monday', 'Sunday'] }),
+    });
+    row.selected = settings.get_string('calendar-week-start') === 'sunday' ? 1 : 0;
+    row.connect('notify::selected', () => {
+        settings.set_string('calendar-week-start', row.selected === 1 ? 'sunday' : 'monday');
+    });
+    group.add(row);
+
+    return group;
+}
+
+const QUICKLAUNCH_MAX_PINNED = 8;
+
+function buildQuickLaunchSettingsGroup(settings) {
+    let group = new Adw.PreferencesGroup({
+        title: 'Quick Launch',
+        description: `Pinned apps always appear first (up to ${QUICKLAUNCH_MAX_PINNED} slots, 4 per row); remaining slots automatically fill with your most-used apps.`,
+    });
+
+    function loadPinned() {
+        try {
+            let parsed = JSON.parse(settings.get_string('quicklaunch-pinned-apps'));
+            return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function savePinned(ids) {
+        settings.set_string('quicklaunch-pinned-apps', JSON.stringify(ids));
+    }
+
+    let searchEntry = new Gtk.SearchEntry({ placeholder_text: 'Search installed apps to pin…' });
+    let searchRow = new Adw.ActionRow();
+    searchRow.set_child(searchEntry);
+    group.add(searchRow);
+
+    let resultsBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 2, visible: false });
+    let resultsRow = new Adw.ActionRow();
+    resultsRow.set_child(resultsBox);
+    group.add(resultsRow);
+
+    function render() {
+        for (let row of [...(group._pinnedRows || [])])
+            group.remove(row);
+        group._pinnedRows = [];
+
+        let pinned = loadPinned();
+
+        pinned.forEach((desktopId, index) => {
+            let appInfo = Gio.DesktopAppInfo.new(desktopId);
+            let row = new Adw.ActionRow({
+                title: appInfo ? appInfo.get_display_name() : desktopId,
+                subtitle: appInfo ? '' : 'App not found on this system',
+            });
+            if (appInfo && appInfo.get_icon())
+                row.add_prefix(new Gtk.Image({ gicon: appInfo.get_icon(), pixel_size: 24 }));
+
+            let removeButton = new Gtk.Button({
+                icon_name: 'user-trash-symbolic',
+                valign: Gtk.Align.CENTER,
+                css_classes: ['flat'],
+                tooltip_text: 'Unpin',
+            });
+            removeButton.connect('clicked', () => {
+                let ids = loadPinned();
+                ids.splice(index, 1);
+                savePinned(ids);
+                render();
+            });
+            row.add_suffix(removeButton);
+
+            // Insert before the search/results rows so new pins land above them.
+            group.add(row);
+            group._pinnedRows.push(row);
+        });
+
+        searchEntry.sensitive = pinned.length < QUICKLAUNCH_MAX_PINNED;
+        searchEntry.placeholder_text = pinned.length < QUICKLAUNCH_MAX_PINNED
+            ? 'Search installed apps to pin…'
+            : `Maximum of ${QUICKLAUNCH_MAX_PINNED} pinned apps reached`;
+    }
+
+    searchEntry.connect('search-changed', () => {
+        let query = searchEntry.get_text().trim().toLowerCase();
+        let child = resultsBox.get_first_child();
+        while (child) {
+            let next = child.get_next_sibling();
+            resultsBox.remove(child);
+            child = next;
+        }
+
+        if (!query) {
+            resultsBox.visible = false;
+            return;
+        }
+
+        let pinned = loadPinned();
+        let matches = Gio.AppInfo.get_all()
+            .filter((info) => info.should_show() && info.get_display_name().toLowerCase().includes(query))
+            .filter((info) => !pinned.includes(info.get_id()))
+            .slice(0, 6);
+
+        for (let info of matches) {
+            let button = new Gtk.Button({ css_classes: ['flat'] });
+            let box = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 8 });
+            if (info.get_icon())
+                box.append(new Gtk.Image({ gicon: info.get_icon(), pixel_size: 20 }));
+            box.append(new Gtk.Label({ label: info.get_display_name(), xalign: 0, hexpand: true }));
+            button.set_child(box);
+
+            button.connect('clicked', () => {
+                let ids = loadPinned();
+                if (!ids.includes(info.get_id()) && ids.length < QUICKLAUNCH_MAX_PINNED) {
+                    ids.push(info.get_id());
+                    savePinned(ids);
+                }
+                searchEntry.set_text('');
+                render();
+            });
+
+            resultsBox.append(button);
+        }
+
+        resultsBox.visible = matches.length > 0;
+    });
+
+    group._pinnedRows = [];
+    render();
 
     return group;
 }
