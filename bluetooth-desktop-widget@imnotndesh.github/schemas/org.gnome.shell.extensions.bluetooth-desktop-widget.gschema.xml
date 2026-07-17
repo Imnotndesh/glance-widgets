@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist>
-  <schema id="org.gnome.shell.extensions.bluetooth-desktop-widget"
-          path="/org/gnome/shell/extensions/bluetooth-desktop-widget/">
+  <schema id="org.gnome.shell.extensions.glance-widgets"
+          path="/org/gnome/shell/extensions/glance-widgets/">
+
     <key name="widgets-config" type="s">
       <default>'[{"id":"bluetooth","enabled":true}]'</default>
       <summary>Enabled widgets and their order</summary>
@@ -25,7 +26,6 @@
         percentage rings.
       </description>
     </key>
-
 
     <key name="weather-api-key" type="s">
       <default>''</default>
@@ -60,11 +60,17 @@
       <summary>Seconds between photo changes in the slideshow</summary>
     </key>
 
+    <!-- Storage widget -->
     <key name="storage-mount-path" type="s">
       <default>'/'</default>
       <summary>Filesystem path to report storage usage for</summary>
     </key>
 
+    <!-- Desktop container layout: which corner of the monitor the widget
+         stack anchors to, how far it sits from the screen edges, the gap
+         between stacked widgets, and — once a column's height would
+         exceed the available screen height — the gap before it overflows
+         into an additional column next to it. -->
     <key name="container-anchor" type="s">
       <choices>
         <choice value="top-left"/>

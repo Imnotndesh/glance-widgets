@@ -8,7 +8,7 @@ import Soup from 'gi://Soup?version=3.0';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const SETTINGS_SCHEMA = 'org.gnome.shell.extensions.bluetooth-desktop-widget';
+const SETTINGS_SCHEMA = 'org.gnome.shell.extensions.glance-widgets';
 const SETTINGS_KEY_WIDGETS_CONFIG = 'widgets-config';
 
 function unpackVariantDict(dict) {
@@ -25,7 +25,7 @@ function loadWidgetsConfig(settings) {
         if (Array.isArray(parsed))
             return parsed;
     } catch (e) {
-        logError(e, 'Desktop Widgets: corrupt widgets-config, resetting');
+        logError(e, 'Glance Widgets: corrupt widgets-config, resetting');
     }
     return [{ id: 'bluetooth', enabled: true }];
 }
@@ -35,7 +35,7 @@ function getHttpSession() {
     if (!_httpSession) {
         _httpSession = new Soup.Session();
         _httpSession.timeout = 12;
-        _httpSession.user_agent = 'gnome-shell-bluetooth-desktop-widget/1.0';
+        _httpSession.user_agent = 'gnome-shell-glance-widgets/1.0';
     }
     return _httpSession;
 }
@@ -84,7 +84,7 @@ function getSecretModule() {
         _secretModulePromise = import('gi://Secret')
             .then((m) => m.default)
             .catch((e) => {
-                logError(e, 'Desktop Widgets: libsecret unavailable, falling back to GSettings storage for the Immich API key');
+                logError(e, 'Glance Widgets: libsecret unavailable, falling back to GSettings storage for the Immich API key');
                 return null;
             });
     }
@@ -98,7 +98,7 @@ async function getPhotosSecretSchema() {
         return null;
     if (!_photosSecretSchema) {
         _photosSecretSchema = new Secret.Schema(
-            'org.gnome.shell.extensions.bluetooth-desktop-widget.photos',
+            'org.gnome.shell.extensions.glance-widgets.photos',
             Secret.SchemaFlags.NONE,
             { 'instance-url': Secret.SchemaAttributeType.STRING }
         );
@@ -126,7 +126,7 @@ async function lookupApiKey(instanceUrl, settings) {
                 try {
                     apiKey = Secret.password_lookup_finish(result);
                 } catch (e) {
-                    logError(e, 'Desktop Widgets: failed to look up Immich API key');
+                    logError(e, 'Glance Widgets: failed to look up Immich API key');
                 }
                 resolve(apiKey || settings.get_string('photos-api-key-plain') || null);
             }
@@ -1406,7 +1406,7 @@ class PhotosWidget {
     }
 
     _cacheFileForAsset(assetId) {
-        let dir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'bluetooth-desktop-widget', 'photos']);
+        let dir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'glance-widgets', 'photos']);
         GLib.mkdir_with_parents(dir, 0o700);
         // Reuse one file per position in the rotation (rather than per asset)
         // so the on-disk cache doesn't grow unboundedly for large albums.
@@ -1519,7 +1519,7 @@ export default class DesktopWidgetsExtension extends Extension {
             try {
                 instance.destroy();
             } catch (e) {
-                logError(e, 'Desktop Widgets: error destroying widget');
+                logError(e, 'Glance Widgets: error destroying widget');
             }
         }
         this._activeWidgets = [];
@@ -1553,7 +1553,7 @@ export default class DesktopWidgetsExtension extends Extension {
 
             let def = WIDGET_DEFS[entry.id];
             if (!def) {
-                log(`Desktop Widgets: unknown widget id "${entry.id}" in config, skipping`);
+                log(`Glance Widgets: unknown widget id "${entry.id}" in config, skipping`);
                 continue;
             }
 
@@ -1562,7 +1562,7 @@ export default class DesktopWidgetsExtension extends Extension {
             try {
                 actor = instance.build();
             } catch (e) {
-                logError(e, `Desktop Widgets: failed to build widget "${entry.id}"`);
+                logError(e, `Glance Widgets: failed to build widget "${entry.id}"`);
                 continue;
             }
 
