@@ -63,7 +63,7 @@ const WIDGET_CATALOG = [
     {
         id: 'github-prs',
         name: 'GitHub PRs',
-        icon: 'merge-symbolic',
+        icon: 'document-edit-symbolic',
         implemented: true,
         buildSettings: buildGithubSettingsGroup,
     },
@@ -650,6 +650,9 @@ function githubRequest(url, token, callback) {
     }
     message.request_headers.append('Authorization', `Bearer ${token}`);
     message.request_headers.append('Accept', 'application/vnd.github+json');
+    // GitHub's API returns 403 Forbidden without a User-Agent header — it's
+    // mandatory on every request, not optional.
+    message.request_headers.append('User-Agent', 'glance-widgets-gnome-extension');
 
     session.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session_, result) => {
         try {

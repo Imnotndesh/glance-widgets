@@ -241,6 +241,9 @@ function fetchGithubJson(url, token) {
         message.request_headers.append('Authorization', `Bearer ${token}`);
         message.request_headers.append('Accept', 'application/vnd.github+json');
         message.request_headers.append('X-GitHub-Api-Version', '2022-11-28');
+        // GitHub's API returns 403 Forbidden if no User-Agent header is
+        // present at all — it's mandatory, not optional.
+        message.request_headers.append('User-Agent', 'glance-widgets-gnome-extension');
 
         getHttpSession().send_and_read_async(
             message, GLib.PRIORITY_DEFAULT, null,
@@ -271,8 +274,7 @@ function fetchGithubGraphQL(query, variables, token) {
         }
         message.request_headers.append('Authorization', `Bearer ${token}`);
         message.request_headers.append('Accept', 'application/vnd.github+json');
-
-        let body = JSON.stringify({ query, variables });
+        message.request_headers.append('User-Agent', 'glance-widgets-gnome-extension');
         message.set_request_body_from_bytes('application/json', new GLib.Bytes(new TextEncoder().encode(body)));
 
         getHttpSession().send_and_read_async(
@@ -1695,14 +1697,17 @@ class NowPlayingWidget {
         this._controls.opacity = sensitive ? 255 : 100;
     }
 
-    _refreshPlayerList() {
+    async _refreshPlayerList() {
         if (this._destroyed)
             return;
         try {
-            let result = this._bus.call_sync(
+            let result = await this._dbusCall(
                 DBUS_IFACE, '/org/freedesktop/DBus', DBUS_IFACE, 'ListNames',
-                null, GLib.VariantType.new('(as)'), Gio.DBusCallFlags.NONE, -1, null
+                null, GLib.VariantType.new('(as)')
             );
+            if (this._destroyed)
+                return;
+
             let names = result.deep_unpack()[0].filter((n) => n.startsWith(MPRIS_PREFIX));
 
             if (names.length === 0) {
@@ -1713,7 +1718,10 @@ class NowPlayingWidget {
 
             let chosen = names[0];
             for (let name of names) {
-                if (this._getPlaybackStatus(name) === 'Playing') {
+                let status = await this._getPlaybackStatus(name);
+                if (this._destroyed)
+                    return;
+                if (status === 'Playing') {
                     chosen = name;
                     break;
                 }
@@ -1722,18 +1730,40 @@ class NowPlayingWidget {
             if (chosen !== this._activeBusName)
                 this._subscribeToPlayer(chosen);
 
-            this._updateFromBusName(chosen);
+            await this._updateFromBusName(chosen);
         } catch (e) {
             logError(e, 'Now Playing widget: failed to list media players');
         }
     }
 
-    _getPlaybackStatus(busName) {
+    // All D-Bus calls in this widget go through here, asynchronously. MPRIS
+    // players are arbitrary user apps (browsers, buggy clients, etc.) and a
+    // synchronous call_sync() to a slow or unresponsive one blocks GNOME
+    // Shell's entire main loop — freezing the whole desktop, not just this
+    // widget. A bounded async call can never do that: a stuck player just
+    // means this widget doesn't update, nothing more.
+    _dbusCall(busName, objectPath, iface, method, parameters, replyType) {
+        return new Promise((resolve, reject) => {
+            this._bus.call(
+                busName, objectPath, iface, method, parameters, replyType,
+                Gio.DBusCallFlags.NONE, 3000, null,
+                (connection, result) => {
+                    try {
+                        resolve(connection.call_finish(result));
+                    } catch (e) {
+                        reject(e);
+                    }
+                }
+            );
+        });
+    }
+
+    async _getPlaybackStatus(busName) {
         try {
-            let result = this._bus.call_sync(
+            let result = await this._dbusCall(
                 busName, MPRIS_PATH, PROPS_IFACE, 'Get',
                 new GLib.Variant('(ss)', [MPRIS_PLAYER_IFACE, 'PlaybackStatus']),
-                GLib.VariantType.new('(v)'), Gio.DBusCallFlags.NONE, -1, null
+                GLib.VariantType.new('(v)')
             );
             return result.deep_unpack()[0].deep_unpack();
         } catch (e) {
@@ -1749,8 +1779,21 @@ class NowPlayingWidget {
         this._propsSignalId = this._bus.signal_subscribe(
             busName, PROPS_IFACE, 'PropertiesChanged', MPRIS_PATH, null,
             Gio.DBusSignalFlags.NONE,
-            () => this._updateFromBusName(busName)
+            () => this._onPropertiesChanged(busName)
         );
+    }
+
+    _onPropertiesChanged(busName) {
+        // Some players (browser tabs especially) fire PropertiesChanged
+        // several times a second for playback position. Throttle so we
+        // don't flood D-Bus with GetAll calls.
+        let now = GLib.get_monotonic_time();
+        if (this._lastPropsUpdate && now - this._lastPropsUpdate < 500 * 1000)
+            return;
+        this._lastPropsUpdate = now;
+        this._updateFromBusName(busName).catch((e) => {
+            logError(e, 'Now Playing widget: failed to handle property update');
+        });
     }
 
     _unsubscribeProps() {
@@ -1760,17 +1803,20 @@ class NowPlayingWidget {
         }
     }
 
-    _updateFromBusName(busName) {
+    async _updateFromBusName(busName) {
         if (this._destroyed || !busName) {
             this._renderNothingPlaying();
             return;
         }
         try {
-            let result = this._bus.call_sync(
+            let result = await this._dbusCall(
                 busName, MPRIS_PATH, PROPS_IFACE, 'GetAll',
                 new GLib.Variant('(s)', [MPRIS_PLAYER_IFACE]),
-                GLib.VariantType.new('(a{sv})'), Gio.DBusCallFlags.NONE, -1, null
+                GLib.VariantType.new('(a{sv})')
             );
+            if (this._destroyed)
+                return;
+
             let props = unpackVariantDict(result.deep_unpack()[0]);
             let metadata = props.Metadata || {};
             let title = metadata['xesam:title'] || 'Unknown title';
@@ -1916,7 +1962,7 @@ class QuickTogglesWidget {
 
         let row = new St.BoxLayout({ x_align: Clutter.ActorAlign.CENTER, style: 'spacing: 12px;' });
 
-        this._dndButton = this._makeToggleButton('notifications-symbolic', 'Do Not Disturb');
+        this._dndButton = this._makeToggleButton('audio-volume-muted-symbolic', 'Do Not Disturb');
         this._dndButton.connect('clicked', () => {
             let dndCurrentlyOn = !this._notifSettings.get_boolean('show-banners');
             this._notifSettings.set_boolean('show-banners', dndCurrentlyOn);
@@ -1924,7 +1970,7 @@ class QuickTogglesWidget {
         row.add_child(this._dndButton);
 
         if (this._colorSettings) {
-            this._nightLightButton = this._makeToggleButton('night-light-symbolic', 'Night Light');
+            this._nightLightButton = this._makeToggleButton('display-brightness-symbolic', 'Night Light');
             this._nightLightButton.connect('clicked', () => {
                 let current = this._colorSettings.get_boolean('night-light-enabled');
                 this._colorSettings.set_boolean('night-light-enabled', !current);
@@ -2032,7 +2078,7 @@ class GithubPRWidget {
 
         this._contentBox = new St.BoxLayout({ vertical: true, style: 'spacing: 6px;' });
 
-        this._openPrRow = this._buildStatRow('merge-symbolic', 'Open PRs');
+        this._openPrRow = this._buildStatRow('document-edit-symbolic', 'Open PRs');
         this._reviewRow = this._buildStatRow('emblem-important-symbolic', 'Review requests');
         this._contentBox.add_child(this._openPrRow.row);
         this._contentBox.add_child(this._reviewRow.row);
@@ -2457,16 +2503,10 @@ class CalendarWidget {
 
         let row = 1;
         let col = offset;
+        const CELL_SIZE = 24;
         for (let day = 1; day <= daysInMonth; day++) {
             let isToday = day === today;
-            layout.attach(new St.Label({
-                text: `${day}`,
-                x_align: Clutter.ActorAlign.CENTER,
-                y_align: Clutter.ActorAlign.CENTER,
-                style: isToday
-                    ? 'color: white; font-size: 12px; font-weight: 700; background-color: rgba(10,132,255,0.9); border-radius: 999px; padding: 4px 0; min-width: 24px;'
-                    : 'color: rgba(255,255,255,0.85); font-size: 12px; padding: 4px 0; min-width: 24px;',
-            }), col, row, 1, 1);
+            layout.attach(this._makeDayCell(day, isToday, CELL_SIZE), col, row, 1, 1);
 
             col++;
             if (col > 6) {
@@ -2474,6 +2514,32 @@ class CalendarWidget {
                 row++;
             }
         }
+    }
+
+    _makeDayCell(day, isToday, size) {
+        // Fixed-size container so the circular "today" highlight is a true
+        // circle centered on the digit, regardless of whether the day is
+        // one or two digits wide (a label sized to its own text+padding
+        // produces a differently-shaped, off-center pill for "5" vs "25").
+        let cell = new St.Widget({
+            layout_manager: new Clutter.BinLayout(),
+            width: size,
+            height: size,
+            style: isToday
+                ? 'border-radius: 999px; background-color: rgba(10,132,255,0.9);'
+                : '',
+        });
+
+        cell.add_child(new St.Label({
+            text: `${day}`,
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.CENTER,
+            style: isToday
+                ? 'color: white; font-size: 12px; font-weight: 700;'
+                : 'color: rgba(255,255,255,0.85); font-size: 12px;',
+        }));
+
+        return cell;
     }
 }
 
@@ -2676,7 +2742,7 @@ const WIDGET_DEFS = {
     },
     'github-prs': {
         name: 'GitHub PRs',
-        icon: 'merge-symbolic',
+        icon: 'document-edit-symbolic',
         create: (extension) => new GithubPRWidget(extension),
     },
     'github-heatmap': {
