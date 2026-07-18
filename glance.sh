@@ -54,16 +54,17 @@ fetch_latest_release() {
 parse_json() {
     local json="$1"
     local key="$2"
+    key="${key#.}"
     echo "$json" \
         | awk -v k="$key" '
             BEGIN { RS=","; FS=""; found=0 }
             {
-                # Match the key pattern:  "key": "value"
-                match($0, "\"" k "\"[[:space:]]*:[[:space:]]*\"([^\"]+)\"", a)
+                match($0, "\"" k "\"[[:space:]]*:[[:space:]]*\""([^\"]+)"\"", a)
                 if (a[1] != "") { print a[1]; found=1; exit }
             }
             END { if (!found) exit 1 }'
 }
+
 
 version_less_than() {
     local v1="$1" v2="$2"
@@ -111,7 +112,6 @@ do_install() {
 
     info "Latest release: ${tag_name} (version ${version})"
 
-    # Download the source archive
     local archive_url="${GITHUB_API}/tarball/${tag_name}"
     local tmpdir
     tmpdir="$(mktemp -d)"
@@ -131,10 +131,14 @@ do_install() {
     fi
 
     mkdir -p "$TARGET_DIR"
+
     tar -xzf "$archive" -C "$tmpdir" --strip-components=1
-    rm -rf "$TARGET_DIR"
-    mkdir -p "$TARGET_DIR"
-    tar -xzf "$archive" -C "$TARGET_DIR" --strip-components=1
+
+    if [[ -d "${tmpdir}/${UUID}" ]]; then
+        cp -r "${tmpdir}/${UUID}/"* "$TARGET_DIR/"
+    else
+        cp -r "${tmpdir}/"* "$TARGET_DIR/"
+    fi
 
     rm -rf "$tmpdir"
 
@@ -157,6 +161,7 @@ do_install() {
     echo -e "  Then enable it with:"
     echo -e "    ${BOLD}gnome-extensions enable ${UUID}${NC}"
 }
+
 
 
 do_update() {
