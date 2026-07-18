@@ -20,7 +20,8 @@
 
 ## Preview
 
-> *Screenshots coming soon*
+<img width="1171" height="1016" alt="image" src="https://github.com/user-attachments/assets/48edfbb6-04c2-4f2e-817d-f2ba6406ab94" />
+
 
 Glance Widgets places a configurable column of widgets in any corner of your desktop. Each widget is independently toggleable, reorderable, and assignable to a column for a multi-column layout.
 
