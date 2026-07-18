@@ -54,16 +54,9 @@ fetch_latest_release() {
 parse_json() {
     local json="$1"
     local key="$2"
-    key="${key#.}"
-    echo "$json" \
-        | awk -v k="$key" '
-            BEGIN { RS=","; FS=""; found=0 }
-            {
-                match($0, "\"" k "\"[[:space:]]*:[[:space:]]*\""([^\"]+)"\"", a)
-                if (a[1] != "") { print a[1]; found=1; exit }
-            }
-            END { if (!found) exit 1 }'
+    echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
+
 
 
 version_less_than() {
