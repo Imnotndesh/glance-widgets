@@ -12,11 +12,6 @@ const SETTINGS_SCHEMA = 'org.gnome.shell.extensions.glance-widgets';
 const SETTINGS_KEY_WIDGETS_CONFIG = 'widgets-config';
 
 function unwrapVariant(value) {
-    // GVariant values nested inside a dict-of-variants (a{sv}) sometimes need
-    // more than one deep_unpack() call to reach a plain JS value — e.g. MPRIS
-    // Metadata is itself a variant wrapping *another* dict of variants
-    // (xesam:title, xesam:artist, ...). Keep unwrapping until we hit a plain
-    // value instead of assuming a fixed nesting depth.
     while (value && typeof value.deep_unpack === 'function')
         value = value.deep_unpack();
     return value;
@@ -86,9 +81,6 @@ function fetchJson(url) {
     });
 }
 
-// See prefs.js for why libsecret is loaded lazily rather than imported at
-// module scope: a missing typelib there must not stop the whole extension
-// (or the whole prefs window) from loading.
 let _secretModulePromise = null;
 function getSecretModule() {
     if (!_secretModulePromise) {
@@ -252,8 +244,6 @@ function fetchGithubJson(url, token) {
         message.request_headers.append('Authorization', `Bearer ${token}`);
         message.request_headers.append('Accept', 'application/vnd.github+json');
         message.request_headers.append('X-GitHub-Api-Version', '2022-11-28');
-        // GitHub's API returns 403 Forbidden if no User-Agent header is
-        // present at all — it's mandatory, not optional.
         message.request_headers.append('User-Agent', 'glance-widgets-gnome-extension');
 
         getHttpSession().send_and_read_async(
@@ -1008,8 +998,6 @@ class ClockWidget {
     }
 
     _scheduleTick() {
-        // Repaint once a second — cheap for a small cairo face, and keeps
-        // the second hand smooth without any external dependency.
         this._tickTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
             if (this._face)
                 this._face.queue_repaint();
@@ -1527,7 +1515,6 @@ class PhotosWidget {
         };
 
         if (isFirstPhoto) {
-            // Nothing to crossfade from yet — just show it.
             this._imageBin.opacity = 0;
             setImage();
             this._imageBin.ease({
@@ -1558,8 +1545,6 @@ class PhotosWidget {
     _cacheFileForAsset(assetId) {
         let dir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'glance-widgets', 'photos']);
         GLib.mkdir_with_parents(dir, 0o700);
-        // Reuse one file per position in the rotation (rather than per asset)
-        // so the on-disk cache doesn't grow unboundedly for large albums.
         let slot = this._assetIndex % 6;
         return GLib.build_filenamev([dir, `thumb-${slot}-${assetId}.jpg`]);
     }
@@ -1700,9 +1685,6 @@ class NowPlayingWidget {
             style: 'border-radius: 999px; padding: 8px; background-color: rgba(255,255,255,0.08);',
             child: icon,
         });
-        // Stashed directly rather than read back via button.child later —
-        // more reliable across St.Button internals than relying on the
-        // child-property round trip.
         button._icon = icon;
         return button;
     }
@@ -1755,12 +1737,6 @@ class NowPlayingWidget {
         }
     }
 
-    // All D-Bus calls in this widget go through here, asynchronously. MPRIS
-    // players are arbitrary user apps (browsers, buggy clients, etc.) and a
-    // synchronous call_sync() to a slow or unresponsive one blocks GNOME
-    // Shell's entire main loop — freezing the whole desktop, not just this
-    // widget. A bounded async call can never do that: a stuck player just
-    // means this widget doesn't update, nothing more.
     _dbusCall(busName, objectPath, iface, method, parameters, replyType) {
         return new Promise((resolve, reject) => {
             this._bus.call(
@@ -2452,8 +2428,6 @@ class CalendarWidget {
         this._settingsChangedId = this._settings.connect('changed::calendar-week-start', () => this._render());
 
         this._render();
-        // Cheap to re-render hourly; catches both the date rollover and any
-        // week-start setting change without needing precise midnight timing.
         this._refreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3600, () => {
             this._render();
             return GLib.SOURCE_CONTINUE;
@@ -2515,7 +2489,7 @@ class CalendarWidget {
         let year = now.get_year();
         let month = now.get_month();
         let firstOfMonth = GLib.DateTime.new_local(year, month, 1, 0, 0, 0);
-        let firstWeekday = firstOfMonth.get_day_of_week(); // GLib: Monday=1 ... Sunday=7
+        let firstWeekday = firstOfMonth.get_day_of_week();
         let offset = weekStartsSunday ? firstWeekday % 7 : firstWeekday - 1;
 
         let daysInMonth = this._daysInMonth(year, month);
@@ -2537,10 +2511,6 @@ class CalendarWidget {
     }
 
     _makeDayCell(day, isToday, size) {
-        // Fixed-size container so the circular "today" highlight is a true
-        // circle centered on the digit, regardless of whether the day is
-        // one or two digits wide (a label sized to its own text+padding
-        // produces a differently-shaped, off-center pill for "5" vs "25").
         let cell = new St.Widget({
             layout_manager: new Clutter.BinLayout(),
             width: size,
@@ -2793,11 +2763,8 @@ const LAYOUT_SETTINGS_KEYS = [
 export default class DesktopWidgetsExtension extends Extension {
     enable() {
         this._settings = this.getSettings(SETTINGS_SCHEMA);
-        this._activeWidgets = []; // [{ id, instance }]
+        this._activeWidgets = [];
 
-        // this._columnsBox holds one or more vertical columns; a column
-        // overflows into a new one once its stacked widgets would run past
-        // the bottom of the usable screen area.
         this._columnsBox = new St.BoxLayout({ vertical: false });
         Main.layoutManager._backgroundGroup.add_child(this._columnsBox);
 
@@ -2873,10 +2840,7 @@ export default class DesktopWidgetsExtension extends Extension {
 
         let config = loadWidgetsConfig(this._settings);
 
-        // Group enabled widgets by their explicit column assignment (set in
-        // preferences; 1 = the column nearest the anchored corner),
-        // preserving each widget's relative order within its column.
-        let columns = new Map(); // columnNumber -> [actor, ...]
+        let columns = new Map();
 
         for (let entry of config) {
             if (!entry.enabled)
@@ -2905,16 +2869,6 @@ export default class DesktopWidgetsExtension extends Extension {
             this._activeWidgets.push({ id: entry.id, instance });
         }
 
-        // Column 1 must end up visually nearest the anchored corner. Clutter/St
-        // lay out BoxLayout children in insertion order (first added = leftmost
-        // for a horizontal box, topmost for a vertical one). So:
-        //  - Anchored to the right: insert columns highest-number-first, so
-        //    column 1 is added last and lands rightmost (nearest the edge).
-        //  - Anchored to the left: insert ascending as normal (column 1 first
-        //    = leftmost = nearest the edge).
-        // The same logic applies vertically, within each column, for a
-        // bottom anchor: the first-listed widget should end up nearest the
-        // bottom edge, so the column's children are reversed before adding.
         let horizontalReverse = anchor.endsWith('right');
         let verticalReverse = anchor.startsWith('bottom');
 

@@ -72,7 +72,7 @@ const WIDGET_CATALOG = [
         name: 'GitHub Contributions',
         icon: 'view-grid-symbolic',
         implemented: true,
-        buildSettings: null, // shares the "GitHub" settings group above
+        buildSettings: null,
     },
     {
         id: 'calendar',
@@ -280,14 +280,6 @@ function buildWeatherSettingsGroup(settings) {
 
     return group;
 }
-
-// libsecret's GI typelib (gir1.2-secret-1 / typelib for Secret-1) is not
-// guaranteed to be present on every system. Importing it eagerly at module
-// scope means a missing typelib crashes the *entire* prefs process before
-// fillPreferencesWindow ever runs — which GNOME then reports as a confusing,
-// unrelated "resource:///org/gnome/shell/extensions/extension.js" error.
-// Loading it lazily, and falling back to (less secure) GSettings storage if
-// it's unavailable, keeps the widget usable everywhere.
 let _secretModulePromise = null;
 function getSecretModule() {
     if (!_secretModulePromise) {
@@ -321,7 +313,6 @@ async function storeApiKey(instanceUrl, apiKey, settings) {
     let schema = await getPhotosSecretSchema();
 
     if (!Secret || !schema) {
-        // Fallback: keep it in GSettings so the feature still works.
         settings.set_string('photos-api-key-plain', apiKey);
         return;
     }
@@ -494,8 +485,6 @@ function buildPhotosSettingsGroup(settings) {
             suppressAlbumSignal = false;
 
             albumComboRow.visible = true;
-
-            // If nothing was previously selected, save the default selection.
             if (idx < 0) {
                 let album = albumsData[0];
                 settings.set_string('photos-album-id', album.id);
@@ -543,8 +532,6 @@ function buildPhotosSettingsGroup(settings) {
         settings.set_string('photos-album-id', album.id);
         settings.set_string('photos-album-name', album.albumName);
     });
-
-    // If we already have a saved URL + key, try to populate albums right away.
     if (existingUrl) {
         lookupApiKey(existingUrl, settings).then((key) => {
             if (key)
@@ -572,8 +559,6 @@ function buildPhotosSettingsGroup(settings) {
 
     return group;
 }
-
-// --- GitHub (PR count + contribution heatmap widgets) helpers ----------
 
 let _githubSecretSchema = null;
 async function getGithubSecretSchema() {
@@ -650,8 +635,6 @@ function githubRequest(url, token, callback) {
     }
     message.request_headers.append('Authorization', `Bearer ${token}`);
     message.request_headers.append('Accept', 'application/vnd.github+json');
-    // GitHub's API returns 403 Forbidden without a User-Agent header — it's
-    // mandatory on every request, not optional.
     message.request_headers.append('User-Agent', 'glance-widgets-gnome-extension');
 
     session.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session_, result) => {
@@ -823,8 +806,6 @@ function buildQuickLaunchSettingsGroup(settings) {
                 render();
             });
             row.add_suffix(removeButton);
-
-            // Insert before the search/results rows so new pins land above them.
             group.add(row);
             group._pinnedRows.push(row);
         });

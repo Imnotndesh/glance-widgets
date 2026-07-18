@@ -27,7 +27,6 @@
       </description>
     </key>
 
-    <!-- Weather widget (proof-of-concept keys for future use) -->
     <key name="weather-api-key" type="s">
       <default>''</default>
       <summary>OpenWeather API key</summary>
@@ -61,7 +60,6 @@
       <summary>Seconds between photo changes in the slideshow</summary>
     </key>
 
-    <!-- Storage widget -->
     <key name="storage-mount-path" type="s">
       <default>'/'</default>
       <summary>Filesystem path to report storage usage for</summary>
@@ -107,7 +105,6 @@
       <summary>Fallback plaintext storage for the GitHub token (used only if libsecret is unavailable)</summary>
     </key>
 
-    <!-- Mini Calendar widget -->
     <key name="calendar-week-start" type="s">
       <choices>
         <choice value="sunday"/>
